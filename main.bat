@@ -1,6 +1,8 @@
 @echo off
 setlocal
 
+chcp 65001 >nul
+
 cls
 
 if exist build rmdir /s /q build
@@ -11,6 +13,13 @@ rem /q — без вопросов подтверждения
 
 mkdir build
 
-g++ main.cpp -Os -fno-declone-ctor-dtor -o build/main.exe
+g++ main.cpp -std=c++17 -Os -fno-declone-ctor-dtor -o build\main.exe
+if errorlevel 1 (
+    echo Build failed.
+    pause
+    exit /b 1
+)
 
-.\build\main.exe
+cls
+.\build\main.exe %*
+endlocal

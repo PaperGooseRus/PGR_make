@@ -8,17 +8,17 @@
 
 /**
  * @file read.hpp
- * @brief Построчное чтение из терминала или файла.
+ * @brief Построчное чтение из терминала, файла или произвольного потока.
  */
 
 /**
  * @class read_t
- * @brief Накапливает строки из терминала (std::cin) или из файла.
+ * @brief Накапливает строки из std::cin, файла или произвольного потока.
  *
- * Читает построчно и складывает непустые строки во внутренний вектор.
- * Чтение прекращается по EOF или при встрече пустой строки.
+ * Один экземпляр может читать из разных источников: перед новым чтением
+ * вызовите @ref clear(), чтобы не смешивать данные.
  *
- * Соглашение о кодах возврата (общее для всех методов):
+ * Соглашение о кодах возврата:
  *  - @c 0x00 успех
  *  - @c 0x01 конец ввода (EOF)
  *  - @c 0x02 пустая строка — маркер конца
@@ -27,36 +27,33 @@
  */
 class read_t {
     private:
-        std::string line_;               ///< Буфер текущей строки.
         std::vector<std::string> arr_;   ///< Накопленные непустые строки.
 
         /**
-         * @brief Прочитать одну строку из потока.
-         *
-         * При успехе строка добавляется в @ref arr_.
-         *
-         * @param in Входной поток (std::cin или std::ifstream).
-         * @return @c 0x00 при успехе, @c 0x01 при EOF, @c 0x02 при
-         *         пустой строке, @c 0x03 при ошибке чтения.
+         * @brief Читать строки из потока до EOF или пустой строки.
+         * @param in Входной поток.
+         * @return @c 0x01 при EOF, @c 0x02 при пустой строке,
+         *         @c 0x03 при ошибке чтения.
          */
-        int read_line(std::istream& in) {
-            if (!std::getline(in, line_)) {
-                if (in.eof()) {
-                    return 0x01; // конец ввода
+        int read_all(std::istream& in) {
+            std::string line;
+
+            while (true) {
+                if (!std::getline(in, line)) {
+                    if (in.eof()) {
+                        return 0x01;
+                    }
+
+                    std::cerr << "read_t: read error\n";
+                    return 0x03;
                 }
 
-                std::cerr << "read_t: read error\n";
+                if (line.empty()) {
+                    return 0x02;
+                }
 
-                return 0x03; // реальная ошибка чтения
+                arr_.push_back(line);
             }
-
-            if (line_.empty()) {
-                return 0x02; // пустая строка как маркер конца
-            }
-
-            arr_.push_back(line_);
-
-            return 0x00;
         }
 
     public:
@@ -64,56 +61,48 @@ class read_t {
         ~read_t() = default;
 
         /**
-         * @brief Читать строки из std::cin до EOF или пустой строки.
-         *
-         * Строки добавляются во внутренний буфер (см. @ref data()).
-         * Перед новым чтением при необходимости вызовите @ref clear().
-         *
-         * @return Итоговый статус: @c 0x01 при EOF, @c 0x02 при пустой
-         *         строке, @c 0x03 при ошибке чтения.
+         * @brief Читать из std::cin до EOF или пустой строки.
+         * @return Код возврата (см. описание класса).
          */
-        int read_terminal() {
-            int read_status = 0x00;
-
-            while (read_status == 0x00) {
-                read_status = read_line(std::cin);
-            }
-
-            return read_status;
+        int read() {
+            return read_all(std::cin);
         }
 
         /**
-         * @brief Читать строки из файла до EOF или пустой строки.
+         * @brief Читать из произвольного потока до EOF или пустой строки.
          *
-         * Строки добавляются во внутренний буфер (см. @ref data()).
-         * Перед новым чтением при необходимости вызовите @ref clear().
+         * Удобно для тестов через std::istringstream и для собственных
+         * std::ifstream.
          *
-         * @param path Путь к входному файлу.
-         * @return @c 0x04, если файл не открылся; иначе @c 0x01 при EOF,
-         *         @c 0x02 при пустой строке, @c 0x03 при ошибке чтения.
+         * @param in Входной поток.
+         * @return Код возврата (см. описание класса).
          */
-        int read_file(const std::string& path) {
-            std::ifstream in(path);
+        int read(std::istream& in) {
+            return read_all(in);
+        }
 
-            if (!in) {
-                std::cerr << "read_t: cannot open " << path << '\n';
-
+        /**
+         * @brief Читать из файла до EOF или пустой строки.
+         * @param path Путь к входному файлу.
+         * @return @c 0x04, если файл не открылся; иначе коды как у @ref read().
+         */
+        int read(const std::string& path) {
+            if (path.empty()) {
+                std::cerr << "read_t: empty path\n";
                 return 0x04;
             }
 
-            int read_status = 0x00;
-
-            while (read_status == 0x00) {
-                read_status = read_line(in);
+            std::ifstream in(path);
+            if (!in) {
+                std::cerr << "read_t: cannot open " << path << '\n';
+                return 0x04;
             }
 
-            // ifstream закроется сам в деструкторе
-            return read_status;
+            return read_all(in);
         }
 
         /**
          * @brief Доступ к накопленным строкам.
-         * @return Константная ссылка на внутренний вектор.
          */
         const std::vector<std::string>& data() const {
             return arr_;
