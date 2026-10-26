@@ -29,22 +29,18 @@ struct flag_entry_t {
  * @brief Группа флагов из config/<name>.txt.
  */
 struct flag_group_t {
-    std::string name;                   ///< Имя файла без .txt.
-    std::string title;                  ///< Заголовок для TUI.
-    bool single = true;                 ///< true = выбрать один, false = несколько.
-    std::vector<flag_entry_t> entries;  ///< Допустимые флаги с описаниями.
+    std::string name;
+    std::string title;
+    bool single = true;
+    std::vector<flag_entry_t> entries;
 };
 
 /**
  * @class flag_catalog_t
- * @brief Каталог допустимых флагов, загружаемый из каталога config/.
+ * @brief Каталог допустимых флагов из каталога config/.
  *
- * Формат строки в файле:
- * @code
- * флаг|пояснение
- * @endcode
- * Если разделитель '|' отсутствует, вся строка считается флагом.
- * Пустые строки и строки, начинающиеся с '#', пропускаются.
+ * Формат строки: `флаг|пояснение`. Пустые строки и `#` — пропускаются.
+ * Читается через std::ifstream, чтобы пустые строки не обрывали чтение.
  */
 class flag_catalog_t {
     private:
@@ -53,10 +49,6 @@ class flag_catalog_t {
     public:
         /**
          * @brief Загрузить все группы из каталога.
-         *
-         * Читает файлы напрямую через std::ifstream (НЕ через read_t),
-         * чтобы пустые строки внутри файла не обрывали чтение.
-         *
          * @param dir Каталог с *.txt (например, "config").
          * @return @c 0x00 если загружена хотя бы одна группа,
          *         @c 0x07 если ничего не загружено.
@@ -87,12 +79,8 @@ class flag_catalog_t {
 
                 std::string line;
                 while (std::getline(in, line)) {
-                    if (!line.empty() && line.back() == '\r') {
-                        line.pop_back();
-                    }
-                    if (line.empty() || line[0] == '#') {
-                        continue;
-                    }
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    if (line.empty() || line[0] == '#') continue;
 
                     const auto pos = line.find('|');
                     if (pos == std::string::npos) {
@@ -103,18 +91,14 @@ class flag_catalog_t {
                     }
                 }
 
-                if (!g.entries.empty()) {
-                    ++loaded;
-                }
+                if (!g.entries.empty()) ++loaded;
             }
 
             return loaded > 0 ? 0x00 : 0x07;
         }
 
-        /// @brief Все группы (в порядке меню).
         const std::vector<flag_group_t>& groups() const { return groups_; }
 
-        /// @brief Найти группу по имени; nullptr если нет.
         const flag_group_t* find(const std::string& name) const {
             for (const auto& g : groups_) {
                 if (g.name == name) return &g;
@@ -139,28 +123,28 @@ class make_t {
         /**
          * @brief Полная конфигурация сборки.
          *
-         * Single-поля — строки (пустая строка = не задано).
-         * Multi-поля — векторы строк.
+         * @c source_files — список исходных `.cpp`. Несколько файлов
+         * передаются в компилятор одной командой (one-shot build).
          */
         struct config_t {
-            std::string compiler      = "g++";  ///< Команда компилятора.
-            std::string source_file;            ///< Исходный файл.
-            std::string output_file;            ///< Выходной файл.
+            std::string compiler      = "g++";        ///< Команда компилятора.
+            std::vector<std::string> source_files;    ///< Все .cpp проекта.
+            std::string output_file;                  ///< Выходной файл.
 
-            std::string standard;               ///< -std=c++NN
-            std::string optimization;           ///< -O*
-            std::string debug;                  ///< -g*
-            std::string lto;                    ///< -flto*
-            std::string arch;                   ///< -march/-mtune
+            std::string standard;
+            std::string optimization;
+            std::string debug;
+            std::string lto;
+            std::string arch;
 
-            std::vector<std::string> warnings;        ///< -W*
-            std::vector<std::string> sanitizers;      ///< -fsanitize=*
-            std::vector<std::string> specific_gcc;    ///< только для GCC
-            std::vector<std::string> specific_clang;  ///< только для Clang
+            std::vector<std::string> warnings;
+            std::vector<std::string> sanitizers;
+            std::vector<std::string> specific_gcc;
+            std::vector<std::string> specific_clang;
 
-            std::vector<std::string> include_dirs;    ///< -I<dir>
-            std::vector<std::string> library_dirs;    ///< -L<dir>
-            std::vector<std::string> libraries;       ///< -l<name> или готовый флаг
+            std::vector<std::string> include_dirs;
+            std::vector<std::string> library_dirs;
+            std::vector<std::string> libraries;
         };
 
     private:
@@ -169,9 +153,7 @@ class make_t {
         std::string command_;
 
         static std::string quote_if_needed(const std::string& s) {
-            if (s.find_first_of(" \t") == std::string::npos) {
-                return s;
-            }
+            if (s.find_first_of(" \t") == std::string::npos) return s;
             return "\"" + s + "\"";
         }
 
@@ -179,12 +161,7 @@ class make_t {
         make_t() = default;
         ~make_t() = default;
 
-        /**
-         * @brief Проверить, содержит ли строка shell-метасимволы.
-         *
-         * Используется и внутри make_t, и из TUI — чтобы правила
-         * проверки совпадали в обоих местах.
-         */
+        /// @brief Проверить, содержит ли строка shell-метасимволы.
         static bool has_shell_meta(const std::string& s) {
             return s.find_first_of(";|&`$<>\"\n\r") != std::string::npos;
         }
@@ -192,7 +169,6 @@ class make_t {
         /// @name Сеттеры конфигурации
         /// @{
         void set_compiler(const std::string& v)     { cfg_.compiler      = v; }
-        void set_source_file(const std::string& v)  { cfg_.source_file   = v; }
         void set_output_file(const std::string& v)  { cfg_.output_file   = v; }
         void set_standard(const std::string& v)     { cfg_.standard      = v; }
         void set_optimization(const std::string& v) { cfg_.optimization  = v; }
@@ -200,11 +176,11 @@ class make_t {
         void set_lto(const std::string& v)          { cfg_.lto           = v; }
         void set_arch(const std::string& v)         { cfg_.arch          = v; }
 
+        void set_source_files(const std::vector<std::string>& v)   { cfg_.source_files   = v; }
         void set_warnings(const std::vector<std::string>& v)       { cfg_.warnings       = v; }
         void set_sanitizers(const std::vector<std::string>& v)     { cfg_.sanitizers     = v; }
         void set_specific_gcc(const std::vector<std::string>& v)   { cfg_.specific_gcc   = v; }
         void set_specific_clang(const std::vector<std::string>& v) { cfg_.specific_clang = v; }
-
         void set_include_dirs(const std::vector<std::string>& v)   { cfg_.include_dirs   = v; }
         void set_library_dirs(const std::vector<std::string>& v)   { cfg_.library_dirs   = v; }
         void set_libraries(const std::vector<std::string>& v)      { cfg_.libraries      = v; }
@@ -216,22 +192,13 @@ class make_t {
          * @brief Собрать @ref args_ из @ref cfg_ с полной валидацией.
          *
          * Порядок:
-         * `compiler -> standard -> optimization -> debug -> warnings
-         *  -> sanitizers -> lto -> arch -> specific_<family>
-         *  -> -I... -> source_file -> -L... -> -l... -> -o output_file`
-         *
-         * Проверяет:
-         *  - непустые компилятор и исходник;
-         *  - отсутствие shell-метасимволов в компиляторе и путях;
-         *  - совместимость санитайзеров;
-         *  - соответствие специфичных флагов компилятору (предупреждение).
-         *
-         * @return @c 0x00 при успехе, @c 0x06 при критической ошибке.
+         * `compiler → standard → optimization → debug → warnings
+         *  → sanitizers → lto → arch → specific_<family>
+         *  → -I... → все source_files → -L... → -l... → -o output`
          */
         int build_args() {
             args_.clear();
 
-            // 1. Критические проверки.
             if (cfg_.compiler.empty()) {
                 std::cerr << "make_t: compiler is empty\n";
                 return 0x06;
@@ -240,39 +207,42 @@ class make_t {
                 std::cerr << "make_t: compiler contains shell metacharacters\n";
                 return 0x06;
             }
-            if (cfg_.source_file.empty()) {
-                std::cerr << "make_t: source_file is empty\n";
+            if (cfg_.source_files.empty()) {
+                std::cerr << "make_t: source_files is empty\n";
                 return 0x06;
             }
-            if (has_shell_meta(cfg_.source_file) ||
-                has_shell_meta(cfg_.output_file)) {
-                std::cerr << "make_t: path contains shell metacharacters\n";
+            if (has_shell_meta(cfg_.output_file)) {
+                std::cerr << "make_t: output path contains shell metacharacters\n";
                 return 0x06;
             }
 
-            // 2. Проверка несовместимых санитайзеров.
+            for (const auto& src : cfg_.source_files) {
+                if (src.empty()) continue;
+                if (has_shell_meta(src)) {
+                    std::cerr << "make_t: source path contains shell metacharacters: "
+                              << src << '\n';
+                    return 0x06;
+                }
+            }
+
             auto has_san = [this](const std::string& s) {
                 return std::find(cfg_.sanitizers.begin(),
                                  cfg_.sanitizers.end(), s)
                        != cfg_.sanitizers.end();
             };
             if (has_san("-fsanitize=address") && has_san("-fsanitize=thread")) {
-                std::cerr << "make_t: -fsanitize=address and -fsanitize=thread "
-                             "are incompatible\n";
+                std::cerr << "make_t: address and thread are incompatible\n";
                 return 0x06;
             }
             if (has_san("-fsanitize=address") && has_san("-fsanitize=memory")) {
-                std::cerr << "make_t: -fsanitize=address and -fsanitize=memory "
-                             "are incompatible\n";
+                std::cerr << "make_t: address and memory are incompatible\n";
                 return 0x06;
             }
             if (has_san("-fsanitize=thread") && has_san("-fsanitize=leak")) {
-                std::cerr << "make_t: -fsanitize=thread and -fsanitize=leak "
-                             "are incompatible\n";
+                std::cerr << "make_t: thread and leak are incompatible\n";
                 return 0x06;
             }
 
-            // 3. Сборка в правильном порядке.
             args_.push_back(cfg_.compiler);
 
             auto add = [this](const std::string& s) {
@@ -290,59 +260,50 @@ class make_t {
             const bool is_clang = cfg_.compiler.find("clang") != std::string::npos;
             if (is_clang) {
                 for (const auto& f : cfg_.specific_clang) args_.push_back(f);
-                if (!cfg_.specific_gcc.empty()) {
-                    std::cerr << "make_t: warning: GCC-specific flags will be "
-                                 "ignored for clang\n";
-                }
+                if (!cfg_.specific_gcc.empty())
+                    std::cerr << "make_t: warning: GCC-specific flags ignored\n";
             } else {
                 for (const auto& f : cfg_.specific_gcc) args_.push_back(f);
-                if (!cfg_.specific_clang.empty()) {
-                    std::cerr << "make_t: warning: Clang-specific flags will be "
-                                 "ignored for GCC\n";
-                }
+                if (!cfg_.specific_clang.empty())
+                    std::cerr << "make_t: warning: Clang-specific flags ignored\n";
             }
 
-            // 4. -I: до исходника.
             for (const auto& dir : cfg_.include_dirs) {
                 if (dir.empty()) continue;
                 if (has_shell_meta(dir)) {
-                    std::cerr << "make_t: include dir contains shell "
-                                 "metacharacters: " << dir << '\n';
+                    std::cerr << "make_t: include dir contains shell meta: "
+                              << dir << '\n';
                     return 0x06;
                 }
                 args_.push_back("-I" + quote_if_needed(dir));
             }
 
-            // 5. Исходник.
-            args_.push_back(quote_if_needed(cfg_.source_file));
+            for (const auto& src : cfg_.source_files) {
+                if (src.empty()) continue;
+                args_.push_back(quote_if_needed(src));
+            }
 
-            // 6. -L: до -l.
             for (const auto& dir : cfg_.library_dirs) {
                 if (dir.empty()) continue;
                 if (has_shell_meta(dir)) {
-                    std::cerr << "make_t: library dir contains shell "
-                                 "metacharacters: " << dir << '\n';
+                    std::cerr << "make_t: library dir contains shell meta: "
+                              << dir << '\n';
                     return 0x06;
                 }
                 args_.push_back("-L" + quote_if_needed(dir));
             }
 
-            // 7. -l (или готовый флаг, если начинается с '-').
             for (const auto& lib : cfg_.libraries) {
                 if (lib.empty()) continue;
                 if (has_shell_meta(lib)) {
-                    std::cerr << "make_t: library name contains shell "
-                                 "metacharacters: " << lib << '\n';
+                    std::cerr << "make_t: library name contains shell meta: "
+                              << lib << '\n';
                     return 0x06;
                 }
-                if (lib[0] == '-') {
-                    args_.push_back(lib);
-                } else {
-                    args_.push_back("-l" + lib);
-                }
+                if (lib[0] == '-') args_.push_back(lib);
+                else               args_.push_back("-l" + lib);
             }
 
-            // 8. Вывод.
             if (!cfg_.output_file.empty()) {
                 args_.push_back("-o");
                 args_.push_back(quote_if_needed(cfg_.output_file));
@@ -353,9 +314,6 @@ class make_t {
 
         const std::vector<std::string>& args() const { return args_; }
 
-        /**
-         * @brief Склеить вектор строк в @ref command_ через пробел.
-         */
         int build_command(const std::vector<std::string>& v) {
             command_.clear();
             const std::string sep = " ";
@@ -377,10 +335,6 @@ class make_t {
         int write_args(write_t& out) const    { return out.write(args_); }
         int write_command(write_t& out) const { return out.write(command_); }
 
-        /**
-         * @brief Выполнить @ref command_ через std::system.
-         * @return @c 0x00 / @c 0x01 / @c 0x02.
-         */
         int run() {
             if (command_.empty()) {
                 std::cerr << "make_t: command is empty\n";
@@ -392,8 +346,8 @@ class make_t {
             int rc = std::system(command_.c_str());
             if (rc != 0) {
                 std::cerr << "make_t: command failed, rc = " << rc << '\n'
-                          << "  Check that '" << cfg_.compiler
-                          << "' is in PATH and source file exists.\n";
+                          << "  Check compiler in PATH, source files exist, "
+                             "and only one main().\n";
                 return 0x02;
             }
             return 0x00;
