@@ -49,23 +49,42 @@ class cmake_writer_t {
                     if (flag.empty() || flag.find_first_not_of(
                         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-=+./:,%") != std::string::npos)
                         return 0x03;
-            // Stage name is fixed, inside project/, without symlinks or traversal.
-            if (stage.lexically_normal() != fs::path(staged_root)) {
-                std::cerr << "cmake stage: invalid destination\n";
-                return 0x03;
-            }
+            // Legacy local stage OR registered project metadata directory.
+            // Refuse arbitrary paths and symlinked stages. Never touch source CMakeLists.
             std::error_code ec;
-            const fs::path parent = fs::weakly_canonical(stage.parent_path(), ec);
-            const fs::path root = fs::weakly_canonical(".", ec);
-            if (ec || parent != root / "project" ||
+            const fs::path normalized = fs::absolute(stage, ec).lexically_normal();
+            const fs::path legacy = fs::absolute(staged_root, ec).lexically_normal();
+            const bool registered = stage.filename() == "generated_cmake" &&
+                fs::is_regular_file(stage.parent_path() / "project.pgr", ec) &&
+                !fs::is_symlink(stage.parent_path(), ec);
+            if (ec || (normalized != legacy && !registered) ||
                 (fs::exists(stage, ec) && fs::is_symlink(stage, ec)) || ec) {
                 std::cerr << "cmake stage: unsafe destination\n";
                 return 0x03;
+            }
+            // Stage is destructive: refuse to erase unowned files.
+            const fs::path marker = stage / ".pgr_make_generated_owner";
+            const std::string signature = "PGR_MAKE_CMAKE_V1\n" +
+                fs::weakly_canonical(stage.parent_path(), ec).generic_u8string() + "\n";
+            if (ec) return 0x03;
+            if (fs::exists(stage, ec)) {
+                if (!fs::is_directory(stage, ec) || ec || fs::is_symlink(marker, ec)) return 0x03;
+                if (!fs::is_empty(stage, ec)) {
+                    std::ifstream current(marker, std::ios::binary);
+                    std::string saved((std::istreambuf_iterator<char>(current)), std::istreambuf_iterator<char>());
+                    if (saved != signature) {
+                        std::cerr << "cmake stage: refusing to overwrite unowned directory\n";
+                        return 0x03;
+                    }
+                }
             }
             fs::remove_all(stage, ec);
             if (ec) return 0x03;
             fs::create_directories(stage, ec);
             if (ec) return 0x03;
+            std::ofstream ownership(marker, std::ios::binary);
+            ownership << signature;
+            if (!ownership) return 0x03;
             // Only metadata is generated here. CMake refers to original source
             // paths, so compile_commands.json and incremental rebuilds remain
             // correct for IDEs, and source files are never duplicated.
@@ -90,7 +109,7 @@ class cmake_writer_t {
         static std::string abs_path(const std::string& p) {
             if (p.empty()) return {};
             std::error_code ec;
-            auto result = std::filesystem::absolute(std::filesystem::path(p), ec);
+            auto result = std::filesystem::absolute(std::filesystem::u8path(p), ec);
             return ec ? p : result.lexically_normal().generic_string();
         }
         static int write_files(const std::map<std::string, std::string>& files,

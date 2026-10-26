@@ -3,6 +3,7 @@
 
 #include <ctime>
 #include <fstream>
+#include <filesystem>
 #include <string>
 
 /**
@@ -30,7 +31,7 @@ class log_t {
          */
         int open(const std::string& path) {
             path_ = path;
-            out_.open(path, std::ios::app);
+            out_.open(std::filesystem::u8path(path), std::ios::app);
             enabled_ = static_cast<bool>(out_);
             return enabled_ ? 0x00 : 0x01;
         }

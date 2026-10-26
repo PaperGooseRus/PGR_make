@@ -1,12 +1,19 @@
-# Build outputs and generated CMake staging
-build/
-build_*/
-build-*/
-build-review/
-build_cmake/
-project/generated_cmake/
-project/work.log
-compile_commands.json
+/build/
+/build-*/
+/build_*/
+/build-win/
+/build-review/
+/.idea/
+/.vscode/
+/.git/
 *.o
 *.obj
 *.exe
+*.log
+*.pyc
+__pycache__/
+
+# PGR-managed build artifacts inside external projects
+.pgr_build/
+.pgr_objects_*/
+compile_commands.json

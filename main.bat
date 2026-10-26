@@ -1,15 +1,6 @@
 @echo off
 setlocal
-chcp 65001 >nul
-REM Safe incremental build. Never delete the build directory automatically.
-if not exist build mkdir build
+call "%~dp0build_windows.bat"
 if errorlevel 1 exit /b 1
-
-g++ -std=c++17 -Os -Wall -Wextra -finput-charset=UTF-8 main.cpp -o build\PGR_make.exe
-if errorlevel 1 (
-    echo ERROR: C++ compilation failed.
-    exit /b 1
-)
-
-build\PGR_make.exe %*
+"%~dp0deploy\PGR\PGR_Make.exe" %*
 exit /b %errorlevel%

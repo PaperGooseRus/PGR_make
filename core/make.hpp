@@ -8,12 +8,15 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <sstream>
+#include "builtin_flags.hpp"
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 #include "process_runner.hpp"
+#include "toolchain.hpp"
 #include "read.hpp"
 #include "write.hpp"
 
@@ -64,7 +67,7 @@ class flag_catalog_t {
          * @return @c 0x00 если загружена хотя бы одна группа,
          *         @c 0x07 если ничего не загружено.
          */
-        int load(const std::string& dir) {
+        int load(const std::string& dir = "") {
             groups_ = {
                 {"compiler",       "Компилятор",     true,  {}},
                 {"standard",       "Стандарт C++",   true,  {}},
@@ -81,12 +84,11 @@ class flag_catalog_t {
             int loaded = 0;
 
             for (auto& g : groups_) {
-                const std::string path = dir + "/" + g.name + ".txt";
-                std::ifstream in(path);
-                if (!in) {
-                    std::cerr << "catalog: cannot open " << path << '\n';
-                    continue;
-                }
+                const std::string filename = dir.empty() ? "" : dir + "/" + g.name + ".txt";
+                std::ifstream file(filename);
+                std::istringstream embedded(pgr_builtin::flags(g.name));
+                std::istream& in = file ? static_cast<std::istream&>(file)
+                                         : static_cast<std::istream&>(embedded);
 
                 std::string line;
                 while (std::getline(in, line)) {
@@ -107,6 +109,8 @@ class flag_catalog_t {
 
             return loaded > 0 ? 0x00 : 0x07;
         }
+
+        int load_builtin() { return load(""); }
 
         /// @brief Все группы (в порядке меню).
         const std::vector<flag_group_t>& groups() const { return groups_; }
@@ -184,14 +188,12 @@ class make_t {
         /// @brief Кавычить строку, если в ней есть пробелы или табы.
         static std::string quote_if_needed(const std::string& s) { return s; }
         static bool safe_flag(const std::string& flag) {
+            // ProcessRunner passes this as a single argv element: no shell parsing.
+            // Permit valid definitions (-DNAME="some value") and linker flags.
             if (flag.empty() || flag[0] != '-') return false;
-            for (unsigned char ch : flag) {
-                if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '=' ||
-                    ch == '+' || ch == '.' || ch == '/' || ch == ':' ||
-                    ch == ',' || ch == '@' || ch == '%') continue;
-                return false;
-            }
-            return true;
+            return std::none_of(flag.begin(), flag.end(), [](unsigned char ch) {
+                return ch == 0 || ch == '\r' || ch == '\n';
+            });
         }
 
     public:
@@ -205,7 +207,10 @@ class make_t {
          * проверки совпадали в обоих местах.
          */
         static bool has_shell_meta(const std::string& s) {
-            return s.find_first_of(";|&`$<>\"\n\r") != std::string::npos;
+            // API name retained for compatibility. Paths are passed directly
+            // as argv elements, so only invalid NUL/newline bytes are rejected.
+            return s.find_first_of("\r\n") != std::string::npos ||
+                s.find('\0') != std::string::npos;
         }
 
         int validate_configuration(bool require_sources = false) const {
@@ -486,8 +491,66 @@ class make_t {
                 std::cerr << "make_t: no command arguments (call build_args)\n";
                 return 0x01;
             }
-            std::cout << "Executing: " << pgr_process::display(args_) << '\n' << std::flush;
-            const int rc = pgr_process::run(args_, false, on_output);
+            // g++ treats .c as C++, so compile C translation units with gcc/clang
+            // into independent objects, then let the C++ compiler link everything.
+            std::vector<std::string> c_sources;
+            bool has_cpp = false;
+            for (const auto& src : cfg_.source_files) {
+                if (std::filesystem::u8path(src).extension() == ".c") c_sources.push_back(src);
+                else has_cpp = true;
+            }
+            std::vector<std::string> link_args = args_;
+            const std::string cc = pgr_toolchain::c_compiler(cfg_.compiler);
+            if (!c_sources.empty() && (cc.empty() || !pgr_process::available(cc))) {
+                std::cerr << "make_t: matching C compiler not found: " << cc << '\n';
+                return 0x02;
+            }
+            if (!has_cpp && !c_sources.empty()) {
+                link_args.front() = cc;
+            } else if (!c_sources.empty()) {
+                namespace fs = std::filesystem;
+                const fs::path output = cfg_.output_file.empty() ? fs::u8path("a.out") : fs::u8path(cfg_.output_file);
+                const fs::path objects_dir = (output.has_parent_path() ? output.parent_path() : fs::path(".")) /
+                    fs::u8path(".pgr_objects_" + output.filename().u8string());
+                std::error_code ec;
+                fs::create_directories(objects_dir, ec);
+                if (ec) { std::cerr << "make_t: cannot create object folder: " << ec.message() << '\n'; return 0x02; }
+                std::vector<std::string> objects;
+                const bool clang = cfg_.compiler.find("clang") != std::string::npos;
+                for (size_t i = 0; i < c_sources.size(); ++i) {
+                    fs::path obj = objects_dir / std::to_string(i);
+#ifdef _WIN32
+                    obj += ".obj";
+#else
+                    obj += ".o";
+#endif
+                    std::vector<std::string> cmd = {cc};
+                    auto add = [&](const std::string& flag) { if (!flag.empty()) cmd.push_back(flag); };
+                    add(cfg_.c_standard); add(cfg_.optimization); add(cfg_.debug);
+                    for (const auto& flag : cfg_.warnings) add(flag);
+                    for (const auto& flag : cfg_.sanitizers) add(flag);
+                    add(cfg_.lto); add(cfg_.arch);
+                    for (const auto& flag : clang ? cfg_.specific_clang : cfg_.specific_gcc) add(flag);
+                    for (const auto& path : cfg_.include_dirs) add("-I" + path);
+                    cmd.insert(cmd.end(), {"-c", c_sources[i], "-o", obj.u8string()});
+                    std::cout << "Executing: " << pgr_process::display(cmd) << '\n' << std::flush;
+                    if (pgr_process::run(cmd, false, on_output) != 0) return 0x02;
+                    objects.push_back(obj.u8string());
+                }
+                std::vector<std::string> updated;
+                for (const auto& item : link_args) {
+                    if (std::find(c_sources.begin(), c_sources.end(), item) == c_sources.end())
+                        updated.push_back(item);
+                }
+                // Put objects before the library arguments to satisfy one-pass linkers.
+                auto pos = std::find_if(updated.begin(), updated.end(), [](const std::string& v) {
+                    return v.rfind("-l", 0) == 0 || v.rfind("-L", 0) == 0;
+                });
+                updated.insert(pos, objects.begin(), objects.end());
+                link_args = std::move(updated);
+            }
+            std::cout << "Executing: " << pgr_process::display(link_args) << '\n' << std::flush;
+            const int rc = pgr_process::run(link_args, false, on_output);
             if (rc != 0) {
                 std::cerr << "make_t: compiler failed, rc=" << rc << '\n';
                 return 0x02;
@@ -583,7 +646,7 @@ class make_t {
          *         @c 0x05 при ошибке чтения.
          */
         int load(const std::string& path) {
-            std::ifstream in(path);
+            std::ifstream in(std::filesystem::u8path(path));
             if (!in) return 0x04;
 
             config_t fresh;

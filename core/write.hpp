@@ -2,6 +2,7 @@
 #define WRITE_HPP
 
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -77,7 +78,7 @@ class write_t {
             out_ = nullptr;
             path_ = path;
 
-            file_.open(path, mode);
+            file_.open(std::filesystem::u8path(path), mode);
 
             if (!file_) {
                 std::cerr << "write_t: cannot open " << path_ << '\n';

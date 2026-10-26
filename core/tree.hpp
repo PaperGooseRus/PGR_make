@@ -220,14 +220,14 @@ class tree_t {
 
         int scan_files() {
             std::error_code ec;
-            if (!fs::is_directory(root_, ec)) return 0x01;
+            if (!fs::is_directory(fs::u8path(root_), ec)) return 0x01;
 
-            for (auto it = fs::recursive_directory_iterator(root_, ec);
+            for (auto it = fs::recursive_directory_iterator(fs::u8path(root_), ec);
                  it != fs::recursive_directory_iterator(); ++it)
             {
                 if (ec) return 0x02;
                 const auto& p = it->path();
-                const auto rel = fs::relative(p, root_, ec);
+                const auto rel = fs::relative(p, fs::u8path(root_), ec);
                 if (ec) continue;
                 const std::string rel_norm = normalize(rel);
 
@@ -265,17 +265,17 @@ class tree_t {
             std::vector<std::pair<fs::path, std::string>> candidates;
             if (opts_.resolve_relative_to_file) {
                 const fs::path dir = fs::path(src_rel).parent_path();
-                candidates.emplace_back(fs::path(root_) / dir / inc, normalize(dir));
+                candidates.emplace_back(fs::u8path(root_) / dir / inc, normalize(dir));
             }
             for (const auto& r : opts_.include_roots)
-                candidates.emplace_back(fs::path(root_) / r / inc, r);
+                candidates.emplace_back(fs::u8path(root_) / r / inc, r);
             if (opts_.resolve_relative_to_root)
-                candidates.emplace_back(fs::path(root_) / inc, "");
+                candidates.emplace_back(fs::u8path(root_) / inc, "");
 
             for (const auto& [path, include_root] : candidates) {
                 std::error_code ec;
                 if (fs::is_regular_file(path, ec)) {
-                    const auto rel = fs::relative(path, root_, ec);
+                    const auto rel = fs::relative(path, fs::u8path(root_), ec);
                     if (ec) continue;
                     return {normalize(rel), include_root};
                 }
@@ -288,7 +288,7 @@ class tree_t {
                               bool* has_main,
                               std::vector<std::string>& finder)
         {
-            std::ifstream in(fs::path(root_) / rel);
+            std::ifstream in(fs::u8path(root_) / rel);
             if (!in) return 0x00;
 
             std::set<std::string> seen;
