@@ -1,15 +1,30 @@
-#include <iostream>
+/**
+ * @file main.cpp
+ * @brief Демонстрационный драйвер: ввод с терминала → файл → чтение
+ *        обратно → сборка → запуск.
+ *
+ * Конвейер:
+ *  1. Прочитать строки из std::cin (до EOF или пустой строки).
+ *  2. Записать их в @c build/build_step1.txt.
+ *  3. Прочитать файл обратно и напечатать содержимое.
+ *  4. Сконфигурировать @ref make_t и вывести @c build/build_step2.txt
+ *     (список аргументов).
+ *  5. Склеить аргументы в строку команды и вывести @c build/build_step3.txt.
+ *  6. Прочитать команду из @c build/build_step3.txt и выполнить её.
+ */
+
 #include <filesystem>
+#include <iostream>
 #include <string>
 
 #include "read.hpp"
 #include "write.hpp"
 #include "make.hpp"
 
-int main(int argc, char* argv[]) {
+int main() {
     // --- Подготовка каталогов ---
-    // ofstream не создаёт каталоги — делаем это явно до первой записи,
-    // а также заранее создаём каталог для выходного exe, иначе g++ упадёт.
+    // ofstream не создаёт каталоги — создаём явно до первой записи;
+    // каталог для выходного exe тоже нужен заранее, иначе g++ упадёт.
     std::filesystem::create_directories("build");
     std::filesystem::create_directories("build/test");
 
@@ -34,8 +49,7 @@ int main(int argc, char* argv[]) {
     reader.clear(); // чтобы не смешивать с терминальным вводом
     int read_st = reader.read_file("build/build_step1.txt");
 
-    // 0x01 (EOF) и 0x02 (пустая строка) — нормальное завершение,
-    // остальное — ошибка.
+    // 0x01 (EOF) и 0x02 (пустая строка) — нормальное завершение.
     if (read_st != 0x00 && read_st != 0x01 && read_st != 0x02) {
         std::cerr << "read_file failed, status = " << read_st << '\n';
         return 1;
@@ -85,10 +99,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "=== Step 5: execute command ===\n";
 
-    // Вариант A: выполнить из памяти (быстрее и надёжнее)
+    // Вариант A: выполнить из памяти (быстрее, без чтения файла).
     // int run_st = builder.make_run();
     //
-    // Вариант B: прочитать из файла и выполнить
+    // Вариант B: прочитать из файла и выполнить.
     int run_st = builder.make_run("build/build_step3.txt");
 
     if (run_st != 0x00) {
