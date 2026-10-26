@@ -4,20 +4,22 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <fstream>
 
 class read_t {
     private:
         std::string line_;
         std::vector<std::string> arr_;
 
-        int read_line(void) {
-            if (!std::getline(std::cin, line_)) {
-                if (std::cin.eof()) {
+        int read_line(std::istream& in) {
+            if (!std::getline(in, line_)) {
+                if (in.eof()) {
                     return 0x01; // конец ввода
                 }
 
-                std::cerr << "Error read user cin line\n";
-                return 0x03; // ошибка чтения
+                std::cerr << "Error read line\n";
+
+                return 0x03; // реальная ошибка чтения
             }
 
             if (line_.empty()) {
@@ -25,6 +27,7 @@ class read_t {
             }
 
             arr_.push_back(line_);
+
             return 0x00;
         }
 
@@ -32,22 +35,41 @@ class read_t {
         read_t() = default;
         ~read_t() = default;
 
-        int read(void) {
+        int read_terminal(void) {
             int read_status = 0x00;
 
             while (read_status == 0x00) {
-                read_status = read_line();
+                read_status = read_line(std::cin);
             }
 
             return read_status;
         }
 
-        const std::vector<std::string>& data(void) const {
-            for (std::size_t index = 0; index < arr_.size(); ++index) {
-                std::cout << arr_[index] << std::endl;
+        int read_file(const std::string& path) {
+            std::ifstream in(path);
+
+            if (!in) {
+                std::cerr << "Cannot open file: " << path << std::endl;
+
+                return 0x04;
             }
 
+            int read_status = 0x00;
+
+            while (read_status == 0x00) {
+                read_status = read_line(in);
+            }
+
+            // ifstream закроется сам в деструкторе
+            return read_status;
+        }
+
+        const std::vector<std::string>& data() const {
             return arr_;
+        }
+
+        void clear() {
+            arr_.clear();
         }
 };
 

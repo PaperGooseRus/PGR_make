@@ -49,6 +49,10 @@ class write_t {
 
             return 0x00;
         }
+
+        int write(const std::string& line) {
+            return write_line(line);
+        }
 };
 
 #endif // WRITE_HPP
