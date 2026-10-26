@@ -1,0 +1,7 @@
+# Флаги, которые понимает ТОЛЬКО Clang.
+# Не передаются в gcc: он упадёт с "unrecognized option".
+# (пусто = не добавлять флаг)
+-stdlib=libc++
+-fcolor-diagnostics
+-fno-color-diagnostics
+-Wdeprecated-non-prototype

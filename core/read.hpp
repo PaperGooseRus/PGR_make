@@ -16,8 +16,8 @@
  * @brief Накапливает строки из std::cin, файла или произвольного потока.
  *
  * Один экземпляр может читать из разных источников: перед новым чтением
- * вызовите @ref clear(), чтобы не смешивать данные. Чтение прекращается
- * по EOF или при встрече пустой строки.
+ * вызовите @ref clear(). Чтение прекращается по EOF или при встрече пустой
+ * строки.
  *
  * Соглашение о кодах возврата:
  *  - @c 0x00 успех
@@ -32,6 +32,10 @@ class read_t {
 
         /**
          * @brief Читать строки из потока до EOF или пустой строки.
+         *
+         * Завершающий @c '\r' (CRLF-файлы) отбрасывается: иначе на Windows
+         * строка "GPP\r" не совпадёт с "GPP" при сравнении.
+         *
          * @param in Входной поток.
          * @return @c 0x01 при EOF, @c 0x02 при пустой строке,
          *         @c 0x03 при ошибке чтения.
@@ -49,6 +53,10 @@ class read_t {
                     return 0x03;
                 }
 
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+
                 if (line.empty()) {
                     return 0x02;
                 }
@@ -61,16 +69,12 @@ class read_t {
         read_t() = default;
         ~read_t() = default;
 
-        /**
-         * @brief Читать из std::cin до EOF или пустой строки.
-         */
+        /// @brief Читать из std::cin до EOF или пустой строки.
         int read() {
             return read_all(std::cin);
         }
 
-        /**
-         * @brief Читать из произвольного потока до EOF или пустой строки.
-         */
+        /// @brief Читать из произвольного потока до EOF или пустой строки.
         int read(std::istream& in) {
             return read_all(in);
         }
@@ -96,14 +100,10 @@ class read_t {
         }
 
         /// @brief Доступ к накопленным строкам.
-        const std::vector<std::string>& data() const {
-            return arr_;
-        }
+        const std::vector<std::string>& data() const { return arr_; }
 
         /// @brief Очистить накопленные строки.
-        void clear() {
-            arr_.clear();
-        }
+        void clear() { arr_.clear(); }
 };
 
 #endif // READ_HPP

@@ -1,0 +1,5 @@
+# Link-Time Optimization. Ровно один (single-группа).
+# (пусто = не добавлять флаг)
+-flto
+-flto=thin
+-flto=full

@@ -1,0 +1,9 @@
+# Санитайзеры. Можно выбирать несколько (multi-группа),
+# КРОМЕ несовместимых пар (address + thread, memory + address).
+-fsanitize=address
+-fsanitize=undefined
+-fsanitize=leak
+-fsanitize=thread
+-fsanitize=memory
+-fno-omit-frame-pointer
+-fno-sanitize-recover=all

@@ -15,9 +15,7 @@
  * @class write_t
  * @brief Записывает строки в файл или в терминал.
  *
- * Источник вывода выбирается конструктором или методами @ref open() /
- * @ref open_terminal(). Один экземпляр может поочерёдно писать в разные
- * файлы и в std::cout — создавать новый объект на каждый поток не нужно.
+ * Один экземпляр может поочерёдно писать в разные файлы и в std::cout.
  *
  * Соглашение о кодах возврата:
  *  - @c 0x00 успех
@@ -27,34 +25,25 @@
  */
 class write_t {
     private:
-        std::string path_;                ///< Путь к текущему файлу ("" для терминала).
-        std::ofstream file_;              ///< Файловый поток (RAII-managed).
-        std::ostream* out_ = &std::cout;  ///< Активный поток: &std::cout или &file_.
-        int open_status_ = 0x00;          ///< 0x00 — готов, 0x03 — файл не открылся.
+        std::string path_;
+        std::ofstream file_;
+        std::ostream* out_ = &std::cout;
+        int open_status_ = 0x00;
 
         int write_line(const std::string& line) {
             if (out_ == nullptr) {
                 return 0x01;
             }
-
             *out_ << line << '\n';
-
             if (!*out_) {
                 return 0x02;
             }
-
             return 0x00;
         }
 
     public:
-        /// @brief Конструктор по умолчанию — писать в std::cout.
         write_t() = default;
 
-        /**
-         * @brief Конструктор, сразу открывающий файл.
-         * @param path Путь к выходному файлу.
-         * @param mode Режим открытия (по умолчанию — @c std::ios::out).
-         */
         write_t(const std::string& path,
                 std::ios::openmode mode = std::ios::out)
         {
@@ -73,6 +62,13 @@ class write_t {
         int open(const std::string& path,
                  std::ios::openmode mode = std::ios::out)
         {
+            if (path.empty()) {
+                std::cerr << "write_t: empty path\n";
+                open_status_ = 0x03;
+                out_ = nullptr;
+                return 0x03;
+            }
+
             if (file_.is_open()) {
                 file_.close();
             }
@@ -99,38 +95,26 @@ class write_t {
             if (file_.is_open()) {
                 file_.close();
             }
-
             path_.clear();
             out_ = &std::cout;
             open_status_ = 0x00;
         }
 
-        /// @brief Статус после последнего @ref open().
         int status() const { return open_status_; }
-
-        /// @brief Готов ли объект к записи.
         bool is_ready() const { return out_ != nullptr; }
-
-        /// @brief Пишет ли объект в терминал (а не в файл).
         bool is_terminal() const { return out_ == &std::cout; }
 
-        /**
-         * @brief Записать каждую строку вектора отдельной строкой.
-         * @return @c 0x00 / @c 0x01 / @c 0x02.
-         */
+        /// @brief Записать вектор строк (по одной на строку).
         int write(const std::vector<std::string>& lines) {
             if (out_ == nullptr) {
                 return 0x01;
             }
-
             for (const auto& s : lines) {
                 *out_ << s << '\n';
             }
-
             if (!*out_) {
                 return 0x02;
             }
-
             return 0x00;
         }
 
@@ -139,7 +123,7 @@ class write_t {
             return write_line(line);
         }
 
-        /// @brief Явно сбросить буфер в целевой поток.
+        /// @brief Явно сбросить буфер.
         void flush() {
             if (out_ != nullptr) {
                 out_->flush();

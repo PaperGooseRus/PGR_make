@@ -1,0 +1,16 @@
+# Предупреждения. Можно выбирать несколько (multi-группа).
+# Каждый выбранный флаг добавляется в командную строку отдельно.
+-Wall
+-Wextra
+-Wpedantic
+-Wshadow
+-Wconversion
+-Wsign-conversion
+-Wcast-qual
+-Wold-style-cast
+-Wnon-virtual-dtor
+-Woverloaded-virtual
+-Wnull-dereference
+-Wdouble-promotion
+-Wformat=2
+-Werror

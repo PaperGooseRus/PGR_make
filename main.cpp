@@ -1,21 +1,29 @@
 /**
  * @file main.cpp
- * @brief Точка входа: TUI по умолчанию, скриптовый конвейер — по флагу --demo.
+ * @brief TUI по умолчанию, скриптовый конвейер — по флагу --demo.
  */
 
 #include <filesystem>
 #include <iostream>
 #include <string>
 
-#include "TUI.hpp"
+#include "core/read.hpp"
+#include "core/write.hpp"
+#include "core/make.hpp"
+#include "core/TUI.hpp"
 
 /**
- * @brief Скриптовый прогон: терминал → файл → чтение → сборка → запуск.
- * @return 0 при успехе, 1 при ошибке любого шага.
+ * @brief Демонстрационный прогон с защитой от отсутствующих файлов.
+ * @return 0 при успехе, 1 при ошибке.
  */
 static int run_demo() {
     std::filesystem::create_directories("build");
     std::filesystem::create_directories("build/test");
+
+    if (!std::filesystem::exists("test/main.cpp")) {
+        std::cerr << "test/main.cpp not found\n";
+        return 1;
+    }
 
     std::cout << "=== Step 1: read from terminal ===\n";
 
@@ -41,7 +49,6 @@ static int run_demo() {
 
     reader.clear();
     int read_st = reader.read("build/build_step1.txt");
-
     if (read_st != 0x00 && read_st != 0x01 && read_st != 0x02) {
         std::cerr << "read failed, status = " << read_st << '\n';
         return 1;
@@ -59,7 +66,11 @@ static int run_demo() {
     builder.set_source_file("test/main.cpp");
     builder.set_output_file("build/test/main.exe");
     builder.set_optimization("-Os");
-    builder.build_args();
+
+    if (builder.build_args() != 0x00) {
+        std::cerr << "Invalid configuration\n";
+        return 1;
+    }
 
     for (const auto& s : builder.args()) {
         std::cout << "  " << s << '\n';
@@ -78,12 +89,10 @@ static int run_demo() {
     std::cout << "=== Step 4: build command string ===\n";
 
     builder.build_command(builder.args());
-
     if (builder.command().empty()) {
         std::cerr << "Command is empty\n";
         return 1;
     }
-
     std::cout << "  cmd: " << builder.command() << '\n';
 
     write_t writer_step3("build/build_step3.txt");
@@ -132,6 +141,5 @@ int main(int argc, char* argv[]) {
 
     tui_t tui;
     tui.run();
-
     return 0;
 }

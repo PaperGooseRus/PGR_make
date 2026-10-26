@@ -1,0 +1,8 @@
+# Флаги, которые понимает ТОЛЬКО GCC.
+# Не передаются в clang: он упадёт с "unsupported option".
+# (пусто = не добавлять флаг)
+-fno-declone-ctor-dtor
+-fipa-pure-const
+-fipa-cp-clone
+-fhardened
+-fanalyzer
