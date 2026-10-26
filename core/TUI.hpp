@@ -7,6 +7,16 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+    #define NOMINMAX
+    #endif
+    #include <windows.h>
+#endif
+
 #include "cmake_writer.hpp"
 #include "log_t.hpp"
 #include "make.hpp"
@@ -18,10 +28,12 @@
  * @file TUI.hpp
  * @brief Меню конфигурации, генерации CMakeLists.txt и запуска сборки.
  *
- * Персистентность:
- *  - project/config.cfg — сохранённые флаги (auto-load при старте, auto-save
- *    после каждого действия);
- *  - project/work.log   — журнал работы TUI (append, с timestamp).
+ * UX-улучшения:
+ *  - полная перерисовка экрана после каждого действия;
+ *  - компактная сводка в шапке (одна строка вместо 15);
+ *  - значения флагов встроены в пункты меню;
+ *  - статус-строка с результатом последнего действия;
+ *  - группы: Настройки / Действия / Выход, разделители.
  */
 class tui_t {
     private:
@@ -32,10 +44,192 @@ class tui_t {
         log_t log_;
         bool running_ = true;
 
+        std::string status_;             ///< Текст статуса для следующей отрисовки.
+        bool status_is_error_ = false;   ///< Статус — ошибка ([!] вместо [ ]).
+
         static constexpr const char* kConfigPath = "project/config.cfg";
         static constexpr const char* kLogPath    = "project/work.log";
+        static constexpr const char* kTitle      = "PGR_make";
 
-        // ---------- Ввод ----------
+        // ------------------------------------------------------------------
+        // Экран
+        // ------------------------------------------------------------------
+
+#ifdef _WIN32
+        /// @brief Очистка экрана через Win32 (быстро, без мерцания).
+        static void clear_screen() {
+            HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+            CONSOLE_SCREEN_BUFFER_INFO info;
+            if (!GetConsoleScreenBufferInfo(h, &info)) {
+                std::cout << "\033[2J\033[H" << std::flush;
+                return;
+            }
+            DWORD cells = info.dwSize.X * info.dwSize.Y;
+            DWORD written = 0;
+            COORD origin = {0, 0};
+            FillConsoleOutputCharacterA(h, ' ', cells, origin, &written);
+            FillConsoleOutputAttribute(h, info.wAttributes, cells, origin, &written);
+            SetConsoleCursorPosition(h, origin);
+        }
+#else
+        /// @brief Очистка экрана через ANSI.
+        static void clear_screen() {
+            std::cout << "\033[2J\033[H" << std::flush;
+        }
+#endif
+
+        /// @brief Пауза до Enter (для длинного вывода перед перерисовкой).
+        static void wait_enter() {
+            std::cout << "\n-- Enter --" << std::flush;
+            std::string line;
+            std::getline(std::cin, line);
+        }
+
+        /// @brief Ширина строки в печатных столбцах (UTF-8 aware).
+        static std::size_t display_width(const std::string& s) {
+            std::size_t w = 0;
+            for (std::size_t i = 0; i < s.size(); ) {
+                unsigned char c = static_cast<unsigned char>(s[i]);
+                if      (c < 0x80)           { ++i; ++w; }
+                else if ((c & 0xE0) == 0xC0) { i += 2; ++w; }
+                else if ((c & 0xF0) == 0xE0) { i += 3; ++w; }
+                else if ((c & 0xF8) == 0xF0) { i += 4; ++w; }
+                else                         { ++i; ++w; }
+            }
+            return w;
+        }
+
+        /// @brief Дополнить строку пробелами справа до display_width = width.
+        static std::string pad_right(const std::string& s, std::size_t width) {
+            const std::size_t w = display_width(s);
+            if (w >= width) return s;
+            return s + std::string(width - w, ' ');
+        }
+
+        static void print_sep(char c = '-', std::size_t width = 74) {
+            std::cout << std::string(width, c) << '\n';
+        }
+
+        void set_status(const std::string& msg, bool is_error = false) {
+            status_ = msg;
+            status_is_error_ = is_error;
+        }
+
+        // ------------------------------------------------------------------
+        // Отображение значений
+        // ------------------------------------------------------------------
+
+        static std::string disp(const std::string& v) {
+            return v.empty() ? "(не задано)" : v;
+        }
+
+        static std::string disp_list(const std::vector<std::string>& v) {
+            if (v.empty()) return "(не задано)";
+            std::string s;
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                if (i > 0) s += ", ";
+                s += v[i];
+            }
+            return s;
+        }
+
+        // ------------------------------------------------------------------
+        // Шапка и меню
+        // ------------------------------------------------------------------
+
+        void print_summary_line() const {
+            const auto& c = builder_.config();
+
+            print_sep('=', 74);
+            std::cout << " " << kTitle << '\n';
+            print_sep('=', 74);
+
+            std::string s;
+            auto append = [&s](const std::string& v) {
+                if (v.empty()) return;
+                if (!s.empty()) s += " | ";
+                s += v;
+            };
+
+            append(c.compiler);
+            append(c.standard);
+            append(c.optimization);
+            append(c.debug);
+            if (!c.lto.empty())  append(c.lto);
+            if (!c.arch.empty()) append(c.arch);
+
+            const std::size_t extra =
+                c.warnings.size() + c.sanitizers.size()
+              + c.specific_gcc.size() + c.specific_clang.size()
+              + c.include_dirs.size() + c.library_dirs.size()
+              + c.libraries.size();
+            if (extra > 0) append("opt:" + std::to_string(extra));
+
+            if (!c.source_files.empty())
+                append("src:" + std::to_string(c.source_files.size()));
+
+            std::cout << " " << (s.empty() ? "(по умолчанию)" : s) << '\n';
+            print_sep('-', 74);
+        }
+
+        void print_status_line() {
+            if (status_.empty()) return;
+            std::cout << " Статус: " << (status_is_error_ ? "[!] " : "") << status_ << '\n';
+            status_.clear();
+            status_is_error_ = false;
+        }
+
+        static void print_row(int num, const std::string& label,
+                              const std::string& value = "")
+        {
+            std::cout << (num < 10 ? "  " : " ")
+                      << num << ". " << pad_right(label, 28) << value << '\n';
+        }
+
+        void print_body() const {
+            const auto& c = builder_.config();
+
+            std::cout << '\n';
+            print_row(1,  "Компилятор",     c.compiler);
+            print_row(2,  "Стандарт",       disp(c.standard));
+            print_row(3,  "Оптимизация",    disp(c.optimization));
+            print_row(4,  "Отладка",        disp(c.debug));
+            print_row(5,  "Предупреждения", disp_list(c.warnings));
+            print_row(6,  "Санитайзеры",    disp_list(c.sanitizers));
+            print_row(7,  "LTO",            disp(c.lto));
+            print_row(8,  "Архитектура",    disp(c.arch));
+            print_row(9,  "GCC-флаги",      disp_list(c.specific_gcc));
+            print_row(10, "Clang-флаги",    disp_list(c.specific_clang));
+            print_row(11, "Исходники",      disp_list(c.source_files));
+            print_row(12, "Выходной файл",  disp(c.output_file));
+            print_row(13, "Include dirs",   disp_list(c.include_dirs));
+            print_row(14, "Library dirs",   disp_list(c.library_dirs));
+            print_row(15, "Библиотеки",     disp_list(c.libraries));
+
+            print_sep('-', 74);
+
+            print_row(16, "Показать команду");
+            print_row(17, "Собрать (g++)");
+            print_row(18, "Сгенерировать CMakeLists.txt");
+            print_row(19, "Собрать через CMake");
+            print_row(20, "Сохранить конфиг");
+            print_row(21, "Загрузить конфиг");
+
+            print_sep('-', 74);
+            print_row(0,  "Выход");
+        }
+
+        void print_menu() {
+            clear_screen();
+            print_summary_line();
+            print_status_line();
+            print_body();
+        }
+
+        // ------------------------------------------------------------------
+        // Ввод
+        // ------------------------------------------------------------------
+
         static input_result ask_line(const std::string& prompt,
                                      std::string& out,
                                      bool allow_empty = false)
@@ -85,50 +279,10 @@ class tui_t {
             }
         }
 
-        // ---------- Отображение ----------
-        static std::string disp(const std::string& v) {
-            return v.empty() ? "(не задано)" : v;
-        }
+        // ------------------------------------------------------------------
+        // Редактор списка (sub-меню, без перерисовки — чтобы видеть изменения)
+        // ------------------------------------------------------------------
 
-        static std::string disp_list(const std::vector<std::string>& v) {
-            if (v.empty()) return "(не задано)";
-            std::string s;
-            for (std::size_t i = 0; i < v.size(); ++i) {
-                if (i > 0) s += ", ";
-                s += v[i];
-            }
-            return s;
-        }
-
-        static std::string choice_name(int choice) {
-            switch (choice) {
-                case 1:  return "compiler";
-                case 2:  return "standard";
-                case 3:  return "optimization";
-                case 4:  return "debug";
-                case 5:  return "warnings";
-                case 6:  return "sanitizers";
-                case 7:  return "lto";
-                case 8:  return "arch";
-                case 9:  return "specific_gcc";
-                case 10: return "specific_clang";
-                case 11: return "source_files";
-                case 12: return "output_file";
-                case 13: return "include_dirs";
-                case 14: return "library_dirs";
-                case 15: return "libraries";
-                case 16: return "show_command";
-                case 17: return "build_gpp";
-                case 18: return "generate_cmake";
-                case 19: return "build_cmake";
-                case 20: return "save_config";
-                case 21: return "load_config";
-                case 0:  return "exit";
-                default: return "unknown";
-            }
-        }
-
-        // ---------- Редактор списка ----------
         void edit_string_list(const std::string& title,
                               std::vector<std::string>& list,
                               const std::string& add_prompt,
@@ -212,55 +366,10 @@ class tui_t {
             }
         }
 
-        // ---------- Заголовок и меню ----------
-        void print_header() const {
-            const auto& c = builder_.config();
-            std::cout << "\n=== Настройки сборки ===\n"
-                      << "Компилятор:      " << disp(c.compiler)      << '\n'
-                      << "Стандарт:        " << disp(c.standard)      << '\n'
-                      << "Оптимизация:     " << disp(c.optimization)  << '\n'
-                      << "Отладка:         " << disp(c.debug)         << '\n'
-                      << "Предупреждения:  " << disp_list(c.warnings) << '\n'
-                      << "Санитайзеры:     " << disp_list(c.sanitizers) << '\n'
-                      << "LTO:             " << disp(c.lto)           << '\n'
-                      << "Архитектура:     " << disp(c.arch)          << '\n'
-                      << "GCC-флаги:       " << disp_list(c.specific_gcc) << '\n'
-                      << "Clang-флаги:     " << disp_list(c.specific_clang) << '\n'
-                      << "Include dirs:    " << disp_list(c.include_dirs) << '\n'
-                      << "Library dirs:    " << disp_list(c.library_dirs) << '\n'
-                      << "Libraries:       " << disp_list(c.libraries)    << '\n'
-                      << "Исходники:       " << disp_list(c.source_files) << '\n'
-                      << "Выход:           " << disp(c.output_file)   << '\n';
-        }
+        // ------------------------------------------------------------------
+        // Выбор из каталога
+        // ------------------------------------------------------------------
 
-        void print_menu() const {
-            print_header();
-            std::cout << "\n"
-                      << " 1. Компилятор\n"
-                      << " 2. Стандарт C++\n"
-                      << " 3. Оптимизация\n"
-                      << " 4. Отладка\n"
-                      << " 5. Предупреждения\n"
-                      << " 6. Санитайзеры\n"
-                      << " 7. LTO\n"
-                      << " 8. Архитектура\n"
-                      << " 9. GCC-флаги\n"
-                      << "10. Clang-флаги\n"
-                      << "11. Исходные файлы (.cpp)\n"
-                      << "12. Выходной файл\n"
-                      << "13. Директории заголовков (-I)\n"
-                      << "14. Директории библиотек (-L)\n"
-                      << "15. Библиотеки (-l)\n"
-                      << "16. Показать команду\n"
-                      << "17. Собрать (одной командой g++)\n"
-                      << "18. Сгенерировать CMakeLists.txt\n"
-                      << "19. Собрать через CMake\n"
-                      << "20. Сохранить конфиг\n"
-                      << "21. Загрузить конфиг\n"
-                      << " 0. Выход\n";
-        }
-
-        // ---------- Single-группы ----------
         int select_single_from(const flag_group_t& g,
                                const std::string& current)
         {
@@ -316,6 +425,10 @@ class tui_t {
             }
         }
 
+        // ------------------------------------------------------------------
+        // Действия: single-группы
+        // ------------------------------------------------------------------
+
         void do_compiler() {
             auto* g = catalog_.find("compiler");
             if (!g) return;
@@ -331,10 +444,14 @@ class tui_t {
                 std::cout << "  ВНИМАНИЕ: '" << val << "' не найден в PATH\n";
                 bool cont = false;
                 if (ask_yesno("Всё равно использовать?", cont)
-                    != input_result::ok || !cont) return;
+                    != input_result::ok || !cont) {
+                    set_status("Отменено");
+                    return;
+                }
             }
             builder_.set_compiler(val);
             log_.write("[set] compiler=" + val);
+            set_status("Компилятор: " + val);
         }
 
         void do_standard() {
@@ -345,6 +462,7 @@ class tui_t {
             std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
             builder_.set_standard(v);
             log_.write("[set] standard=" + (v.empty() ? "(none)" : v));
+            set_status("Стандарт: " + disp(v));
         }
 
         void do_optimization() {
@@ -355,6 +473,7 @@ class tui_t {
             std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
             builder_.set_optimization(v);
             log_.write("[set] optimization=" + (v.empty() ? "(none)" : v));
+            set_status("Оптимизация: " + disp(v));
         }
 
         void do_debug() {
@@ -365,6 +484,7 @@ class tui_t {
             std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
             builder_.set_debug(v);
             log_.write("[set] debug=" + (v.empty() ? "(none)" : v));
+            set_status("Отладка: " + disp(v));
         }
 
         void do_lto() {
@@ -375,6 +495,7 @@ class tui_t {
             std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
             builder_.set_lto(v);
             log_.write("[set] lto=" + (v.empty() ? "(none)" : v));
+            set_status("LTO: " + disp(v));
         }
 
         void do_arch() {
@@ -385,7 +506,12 @@ class tui_t {
             std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
             builder_.set_arch(v);
             log_.write("[set] arch=" + (v.empty() ? "(none)" : v));
+            set_status("Архитектура: " + disp(v));
         }
+
+        // ------------------------------------------------------------------
+        // Действия: multi-группы
+        // ------------------------------------------------------------------
 
         void do_warnings() {
             auto* g = catalog_.find("warnings");
@@ -394,6 +520,7 @@ class tui_t {
             if (select_multi_from(*g, cur) == input_result::ok) {
                 builder_.set_warnings(cur);
                 log_.write("[set] warnings=" + disp_list(cur));
+                set_status("Предупреждения: " + disp_list(cur));
             }
         }
 
@@ -406,22 +533,23 @@ class tui_t {
                     return std::find(cur.begin(), cur.end(), s) != cur.end();
                 };
                 if (has("-fsanitize=address") && has("-fsanitize=thread")) {
-                    std::cout << "  ОШИБКА: address и thread несовместимы\n";
                     log_.error("sanitizers: address+thread rejected");
+                    set_status("Ошибка: address и thread несовместимы", true);
                     return;
                 }
                 if (has("-fsanitize=address") && has("-fsanitize=memory")) {
-                    std::cout << "  ОШИБКА: address и memory несовместимы\n";
                     log_.error("sanitizers: address+memory rejected");
+                    set_status("Ошибка: address и memory несовместимы", true);
                     return;
                 }
                 if (has("-fsanitize=thread") && has("-fsanitize=leak")) {
-                    std::cout << "  ОШИБКА: thread и leak несовместимы\n";
                     log_.error("sanitizers: thread+leak rejected");
+                    set_status("Ошибка: thread и leak несовместимы", true);
                     return;
                 }
                 builder_.set_sanitizers(cur);
                 log_.write("[set] sanitizers=" + disp_list(cur));
+                set_status("Санитайзеры: " + disp_list(cur));
             }
         }
 
@@ -432,6 +560,7 @@ class tui_t {
             if (select_multi_from(*g, cur) == input_result::ok) {
                 builder_.set_specific_gcc(cur);
                 log_.write("[set] specific_gcc=" + disp_list(cur));
+                set_status("GCC-флаги: " + disp_list(cur));
             }
         }
 
@@ -442,8 +571,13 @@ class tui_t {
             if (select_multi_from(*g, cur) == input_result::ok) {
                 builder_.set_specific_clang(cur);
                 log_.write("[set] specific_clang=" + disp_list(cur));
+                set_status("Clang-флаги: " + disp_list(cur));
             }
         }
+
+        // ------------------------------------------------------------------
+        // Действия: пути и библиотеки
+        // ------------------------------------------------------------------
 
         void do_source_files() {
             auto cur = builder_.config().source_files;
@@ -451,6 +585,7 @@ class tui_t {
                              cur, "Путь к .cpp: ", true, true);
             builder_.set_source_files(cur);
             log_.write("[set] source_files=" + disp_list(cur));
+            set_status("Исходники: " + std::to_string(cur.size()) + " файл(ов)");
         }
 
         void do_output_file() {
@@ -460,11 +595,12 @@ class tui_t {
                 != input_result::ok) return;
             if (v.empty()) return;
             if (make_t::has_shell_meta(v)) {
-                std::cout << "  Недопустимые символы\n";
+                set_status("Недопустимые символы в пути", true);
                 return;
             }
             builder_.set_output_file(v);
             log_.write("[set] output_file=" + v);
+            set_status("Выходной файл: " + v);
         }
 
         void do_include_dirs() {
@@ -473,6 +609,7 @@ class tui_t {
                              cur, "Путь: ", true, false);
             builder_.set_include_dirs(cur);
             log_.write("[set] include_dirs=" + disp_list(cur));
+            set_status("Include dirs: " + disp_list(cur));
         }
 
         void do_library_dirs() {
@@ -481,6 +618,7 @@ class tui_t {
                              cur, "Путь: ", true, false);
             builder_.set_library_dirs(cur);
             log_.write("[set] library_dirs=" + disp_list(cur));
+            set_status("Library dirs: " + disp_list(cur));
         }
 
         void do_libraries() {
@@ -491,38 +629,42 @@ class tui_t {
                              false, false);
             builder_.set_libraries(cur);
             log_.write("[set] libraries=" + disp_list(cur));
+            set_status("Библиотеки: " + disp_list(cur));
         }
+
+        // ------------------------------------------------------------------
+        // Действия: команда и сборка (с wait_enter)
+        // ------------------------------------------------------------------
 
         void do_show_command() {
             if (builder_.config().source_files.empty()) {
-                std::cout << "Сначала задайте исходные файлы (п. 11)\n";
+                set_status("Сначала задайте исходные файлы (п. 11)", true);
                 return;
             }
             if (builder_.build_args() != 0x00) {
-                std::cout << "Ошибка конфигурации\n";
                 log_.error("build_args failed (show_command)");
+                set_status("Ошибка конфигурации (см. project/work.log)", true);
                 return;
             }
             builder_.build_command(builder_.args());
 
-            write_t w;
-            w.write(std::string("Аргументы:"));
-            w.write(builder_.args());
-            w.write(std::string(""));
-            w.write(std::string("Команда:"));
-            w.write(builder_.command());
+            std::cout << "\nАргументы:\n";
+            for (const auto& a : builder_.args()) std::cout << "  " << a << '\n';
+            std::cout << "\nКоманда:\n  " << builder_.command() << '\n';
 
             log_.write("[gpp] command: " + builder_.command());
+            set_status("Команда собрана");
+            wait_enter();
         }
 
         void do_build() {
             if (builder_.config().source_files.empty()) {
-                std::cout << "Сначала задайте исходные файлы (п. 11)\n";
+                set_status("Сначала задайте исходные файлы (п. 11)", true);
                 return;
             }
             if (builder_.build_args() != 0x00) {
-                std::cout << "Ошибка конфигурации\n";
                 log_.error("build_args failed (build)");
+                set_status("Ошибка конфигурации (см. project/work.log)", true);
                 return;
             }
             builder_.build_command(builder_.args());
@@ -535,10 +677,10 @@ class tui_t {
             if (!missing.empty()) {
                 for (const auto& m : missing)
                     std::cout << "  ВНИМАНИЕ: не найден: " << m << '\n';
-                log_.write("[gpp] missing sources: " + disp_list(missing));
+                log_.write("[gpp] missing: " + disp_list(missing));
                 bool cont = false;
                 if (ask_yesno("Продолжить?", cont) != input_result::ok || !cont) {
-                    std::cout << "Отменено\n";
+                    set_status("Отменено");
                     return;
                 }
             }
@@ -550,28 +692,34 @@ class tui_t {
                     std::error_code ec;
                     std::filesystem::create_directories(parent, ec);
                     if (ec) {
-                        std::cout << "  ОШИБКА: каталог " << parent
-                                  << ": " << ec.message() << '\n';
                         log_.error("cannot create " + parent.string() + ": " + ec.message());
+                        set_status("Не удалось создать " + parent.string(), true);
                         return;
                     }
                 }
             }
 
-            std::cout << "Команда:\n  " << builder_.command() << '\n';
+            std::cout << "\nКоманда:\n  " << builder_.command() << '\n';
             log_.write("[gpp] execute: " + builder_.command());
 
             bool ok = false;
             if (ask_yesno("Выполнить?", ok) != input_result::ok || !ok) {
-                std::cout << "Отменено\n";
-                log_.write("[gpp] cancelled by user");
+                set_status("Отменено");
                 return;
             }
 
-            int run_st = builder_.run();
-            std::cout << "Статус: " << run_st << '\n';
-            log_.write("[gpp] rc=" + std::to_string(run_st));
+            std::cout << '\n';
+            int rc = builder_.run();
+            log_.write("[gpp] rc=" + std::to_string(rc));
+
+            if (rc == 0x00) set_status("Сборка (g++): успех");
+            else            set_status("Сборка (g++): ошибка, rc=" + std::to_string(rc), true);
+            wait_enter();
         }
+
+        // ------------------------------------------------------------------
+        // Действия: CMake
+        // ------------------------------------------------------------------
 
         void do_generate_cmake() {
             std::cout << "Сканирование проекта...\n";
@@ -585,15 +733,15 @@ class tui_t {
             tree.set_options(opts);
 
             if (tree.scan() != 0x00) {
-                std::cout << "Ошибка сканирования проекта\n";
                 log_.error("tree.scan failed");
+                set_status("Ошибка сканирования", true);
                 return;
             }
 
             const auto cyc = tree.cycles();
             if (!cyc.empty()) {
-                std::cout << "ОБНАРУЖЕНЫ ЦИКЛЫ в зависимостях:\n";
                 std::string cyc_str;
+                std::cout << "ОБНАРУЖЕНЫ ЦИКЛЫ:\n";
                 for (const auto& c : cyc) {
                     std::cout << "  ";
                     for (const auto& m : c) {
@@ -604,65 +752,63 @@ class tui_t {
                     cyc_str += "| ";
                 }
                 log_.error("cycles: " + cyc_str);
-                std::cout << "CMake не поддерживает циклические зависимости\n";
+                set_status("Обнаружены циклы — CMake невозможен", true);
+                wait_enter();
                 return;
             }
 
             cmake_layout_t layout;
             if (layout.build(tree) != 0x00) {
-                std::cout << "Не удалось построить план CMake\n";
                 log_.error("cmake_layout.build failed");
+                set_status("Не удалось построить план", true);
                 return;
             }
 
             std::cout << "\n=== Таргеты ===\n";
             tree.print_targets();
-
             std::cout << "\n=== План CMake ===\n";
             layout.print();
 
+            bool ok = false;
             if (std::filesystem::exists("CMakeLists.txt")) {
-                bool ok = false;
-                if (ask_yesno("\nCMakeLists.txt уже существует. Перезаписать?",
-                              ok) != input_result::ok || !ok) {
-                    std::cout << "Отменено\n";
-                    log_.write("[cmake] generate cancelled");
+                if (ask_yesno("\nCMakeLists.txt существует. Перезаписать?", ok)
+                    != input_result::ok || !ok) {
+                    set_status("Отменено");
                     return;
                 }
             } else {
-                bool ok = false;
-                if (ask_yesno("\nЗаписать CMakeLists.txt на диск?",
-                              ok) != input_result::ok || !ok) {
-                    std::cout << "Отменено\n";
-                    log_.write("[cmake] generate cancelled");
+                if (ask_yesno("\nЗаписать CMakeLists.txt на диск?", ok)
+                    != input_result::ok || !ok) {
+                    set_status("Отменено");
                     return;
                 }
             }
 
             int st = cmake_writer_t::save(tree, layout, builder_.config());
             if (st == 0x00) {
-                std::cout << "Готово. Создано файлов: "
-                          << layout.files().size() << '\n';
-
                 std::string paths;
-                for (const auto& [path, _] : layout.files()) {
+                for (const auto& [p, _] : layout.files()) {
                     if (!paths.empty()) paths += ", ";
-                    paths += path;
+                    paths += p;
                 }
                 log_.write("[cmake] generated " +
                            std::to_string(layout.files().size()) +
                            " files: " + paths);
+                std::cout << "\nГотово. Создано файлов: "
+                          << layout.files().size() << '\n';
+                set_status("Создано файлов: " + std::to_string(layout.files().size()));
+                wait_enter();
             } else {
-                std::cout << "Ошибка записи, статус: " << st << '\n';
                 log_.error("cmake_writer.save failed rc=" + std::to_string(st));
+                set_status("Ошибка записи, rc=" + std::to_string(st), true);
+                wait_enter();
             }
         }
 
         void do_build_cmake() {
             if (!std::filesystem::exists("CMakeLists.txt")) {
-                std::cout << "CMakeLists.txt не найден. "
-                             "Сначала выполните пункт 18.\n";
                 log_.error("build_cmake: CMakeLists.txt missing");
+                set_status("CMakeLists.txt не найден (п. 18)", true);
                 return;
             }
 
@@ -678,8 +824,8 @@ class tui_t {
 #endif
             if (std::system(check.c_str()) == 0) {
                 bool use_ninja = false;
-                if (ask_yesno("Использовать Ninja (быстрее)?",
-                              use_ninja) == input_result::ok && use_ninja) {
+                if (ask_yesno("Использовать Ninja?", use_ninja)
+                    == input_result::ok && use_ninja) {
                     generator_opt = " -G Ninja";
                 }
             }
@@ -689,60 +835,95 @@ class tui_t {
                 + " -DCMAKE_CXX_COMPILER=" + builder_.config().compiler;
             std::string build_cmd = "cmake --build " + build_dir;
 
-            std::cout << "Configure: " << configure_cmd << '\n';
+            std::cout << "\nConfigure: " << configure_cmd << '\n';
             std::cout << "Build:     " << build_cmd << '\n';
 
             bool ok = false;
             if (ask_yesno("Выполнить?", ok) != input_result::ok || !ok) {
-                std::cout << "Отменено\n";
-                log_.write("[cmake] build cancelled");
+                set_status("Отменено");
                 return;
             }
 
-            log_.write("[cmake] configure: " + configure_cmd);
             std::cout << "\n--- cmake configure ---\n";
+            log_.write("[cmake] configure: " + configure_cmd);
             int rc1 = std::system(configure_cmd.c_str());
             log_.write("[cmake] configure rc=" + std::to_string(rc1));
             if (rc1 != 0) {
-                std::cout << "Configure failed, rc = " << rc1 << '\n';
+                set_status("Configure failed, rc=" + std::to_string(rc1), true);
+                wait_enter();
                 return;
             }
 
-            log_.write("[cmake] build: " + build_cmd);
             std::cout << "\n--- cmake build ---\n";
+            log_.write("[cmake] build: " + build_cmd);
             int rc2 = std::system(build_cmd.c_str());
             log_.write("[cmake] build rc=" + std::to_string(rc2));
             if (rc2 != 0) {
-                std::cout << "Build failed, rc = " << rc2 << '\n';
-                return;
+                set_status("Build failed, rc=" + std::to_string(rc2), true);
+            } else {
+                set_status("Сборка CMake: успех (" + build_dir + ")");
             }
-
-            std::cout << "Готово\n";
+            wait_enter();
         }
+
+        // ------------------------------------------------------------------
+        // Действия: конфиг
+        // ------------------------------------------------------------------
 
         void do_save_config() {
             int st = builder_.save(kConfigPath);
             if (st == 0x00) {
-                std::cout << "Сохранено в " << kConfigPath << '\n';
                 log_.write("[config] saved to " + std::string(kConfigPath));
+                set_status("Сохранено в " + std::string(kConfigPath));
             } else {
-                std::cout << "Ошибка сохранения, статус: " << st << '\n';
                 log_.error("save_config rc=" + std::to_string(st));
+                set_status("Ошибка сохранения, rc=" + std::to_string(st), true);
             }
         }
 
         void do_load_config() {
             int st = builder_.load(kConfigPath);
             if (st == 0x00) {
-                std::cout << "Загружено из " << kConfigPath << '\n';
                 log_.write("[config] loaded from " + std::string(kConfigPath));
+                set_status("Загружено из " + std::string(kConfigPath));
             } else if (st == 0x04) {
-                std::cout << "Файл " << kConfigPath
-                          << " не найден — сначала сохраните конфиг\n";
                 log_.write("[config] load: file not found");
+                set_status("Файл " + std::string(kConfigPath) + " не найден", true);
             } else {
-                std::cout << "Ошибка загрузки, статус: " << st << '\n';
                 log_.error("load_config rc=" + std::to_string(st));
+                set_status("Ошибка загрузки, rc=" + std::to_string(st), true);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Диспетчер
+        // ------------------------------------------------------------------
+
+        static std::string choice_name(int choice) {
+            switch (choice) {
+                case 1:  return "compiler";
+                case 2:  return "standard";
+                case 3:  return "optimization";
+                case 4:  return "debug";
+                case 5:  return "warnings";
+                case 6:  return "sanitizers";
+                case 7:  return "lto";
+                case 8:  return "arch";
+                case 9:  return "specific_gcc";
+                case 10: return "specific_clang";
+                case 11: return "source_files";
+                case 12: return "output_file";
+                case 13: return "include_dirs";
+                case 14: return "library_dirs";
+                case 15: return "libraries";
+                case 16: return "show_command";
+                case 17: return "build_gpp";
+                case 18: return "generate_cmake";
+                case 19: return "build_cmake";
+                case 20: return "save_config";
+                case 21: return "load_config";
+                case 0:  return "exit";
+                default: return "unknown";
             }
         }
 
@@ -773,7 +954,7 @@ class tui_t {
                 case 20: do_save_config();    break;
                 case 21: do_load_config();    break;
                 case 0:  running_ = false;    break;
-                default: std::cout << "Нет такого пункта\n"; break;
+                default: set_status("Нет такого пункта", true); break;
             }
         }
 
@@ -792,33 +973,30 @@ class tui_t {
             }
 
             if (log_.open(kLogPath) != 0x00) {
-                std::cerr << "Не удалось открыть лог " << kLogPath
-                          << " — продолжаю без логирования\n";
+                std::cerr << "Не удалось открыть " << kLogPath
+                          << " — работаю без логирования\n";
             }
             log_.write("=== Session started ===");
 
             if (catalog_.load("config") != 0x00) {
-                std::cerr << "Не удалось загрузить ни одного файла из config/\n";
-                log_.error("catalog.load failed");
+                std::cerr << "Не удалось загрузить config/\n";
                 return;
             }
-            log_.write("[catalog] loaded from config/");
+            log_.write("[catalog] loaded");
 
             if (builder_.load(kConfigPath) != 0x00) {
-                std::cout << "(конфиг не найден — применены значения по умолчанию)\n";
                 log_.write("[config] not found, applying defaults");
-
                 builder_.set_compiler("g++");
                 builder_.set_standard("-std=c++17");
                 builder_.set_optimization("-Os");
                 builder_.set_warnings({"-Wall", "-Wextra"});
                 builder_.set_specific_gcc({"-fno-declone-ctor-dtor"});
                 builder_.set_source_files({"main.cpp"});
-
                 builder_.save(kConfigPath);
+                set_status("Применены значения по умолчанию");
             } else {
-                std::cout << "(конфиг загружен из " << kConfigPath << ")\n";
                 log_.write("[config] loaded from " + std::string(kConfigPath));
+                set_status("Загружено из " + std::string(kConfigPath));
             }
 
             while (running_) {
@@ -827,22 +1005,22 @@ class tui_t {
                 int choice = -1;
                 auto r = ask_int("Выбор: ", 0, 21, choice);
                 if (r == input_result::eof) {
-                    std::cout << "\n(EOF - выход)\n";
                     log_.write("[menu] EOF");
                     break;
                 }
                 if (r == input_result::cancelled) continue;
 
                 handle(choice);
-
                 builder_.save(kConfigPath);
             }
 
             builder_.save(kConfigPath);
             log_.write("=== Session ended ===");
-            std::cout << "Настройки сохранены в " << kConfigPath << '\n';
-            std::cout << "Лог: " << kLogPath << '\n';
-            std::cout << "До встречи!\n";
+
+            clear_screen();
+            std::cout << "Настройки: " << kConfigPath << '\n'
+                      << "Лог:       " << kLogPath << '\n'
+                      << "До встречи!\n";
         }
 };
 
