@@ -1,13 +1,13 @@
 #ifndef TUI_HPP
 #define TUI_HPP
 
+#include <cstdlib>
 #include <iostream>
 #include <string>
-#include <vector>
 
+#include "make.hpp"
 #include "read.hpp"
 #include "write.hpp"
-#include "make.hpp"
 
 /**
  * @file TUI.hpp
@@ -18,36 +18,24 @@
  * @class tui_t
  * @brief Меню-ориентированный текстовый интерфейс.
  *
- * Владеет экземплярами read_t и make_t; write_t создаётся по требованию
- * (терминал — write_t(), файл — write_t(path)).
+ * Владеет read_t и make_t; write_t создаётся по требованию.
+ * Конфигурация сборки хранится в файле @c build/config.txt.
  *
  * Запуск: @code tui_t tui; tui.run(); @endcode
- *
- * Завершение: пункт 0 меню или EOF (Ctrl+Z / Ctrl+D) на любом запросе.
  */
 class tui_t {
     private:
-        read_t reader_;            ///< Накопленные строки.
-        make_t builder_;           ///< Конфигурация и команда сборки.
-        bool running_ = true;      ///< Флаг главного цикла.
+        read_t reader_;          ///< Накопленные строки.
+        make_t builder_;         ///< Конфигурация и команда сборки.
+        bool running_ = true;    ///< Флаг главного цикла.
 
-        /**
-         * @brief Показать запрос и прочитать строку.
-         * @param q Текст запроса (без перевода строки).
-         * @param out Прочитанная строка.
-         * @return @c false при EOF — вызывающий должен завершиться.
-         */
+        static constexpr const char* kConfigPath = "build/config.txt";
+
         static bool ask(const std::string& q, std::string& out) {
             std::cout << q;
             return static_cast<bool>(std::getline(std::cin, out));
         }
 
-        /**
-         * @brief Разобрать целое число из строки целиком.
-         * @param s Строка.
-         * @param out Результат.
-         * @return @c true если вся строка — корректное число.
-         */
         static bool parse_int(const std::string& s, int& out) {
             try {
                 std::size_t pos = 0;
@@ -62,7 +50,6 @@ class tui_t {
             }
         }
 
-        /// @brief Напечатать меню с текущим состоянием.
         void print_menu() const {
             std::cout << "\n=== Меню (строк в памяти: "
                       << reader_.data().size() << ") ===\n"
@@ -78,6 +65,8 @@ class tui_t {
                       << "10. Записать команду в файл\n"
                       << "11. Выполнить команду\n"
                       << "12. Выполнить команду из файла\n"
+                      << "13. Сохранить конфиг\n"
+                      << "14. Загрузить конфиг\n"
                       << " 0. Выход\n";
         }
 
@@ -85,7 +74,7 @@ class tui_t {
             reader_.clear();
             std::cout << "Вводите строки, пустая строка — конец:\n";
             int st = reader_.read();
-            std::cin.clear(); // сбросить eof/fail после Ctrl+Z
+            std::cin.clear();
             std::cout << "Статус: " << st
                       << ", строк: " << reader_.data().size() << "\n";
         }
@@ -114,7 +103,7 @@ class tui_t {
                 return;
             }
 
-            write_t w; // терминал
+            write_t w;
             w.write(reader_.data());
         }
 
@@ -236,6 +225,28 @@ class tui_t {
             }
         }
 
+        void do_save_config() {
+            int st = builder_.save(kConfigPath);
+
+            if (st == 0x00) {
+                std::cout << "Сохранено в " << kConfigPath << "\n";
+            } else {
+                std::cout << "Не удалось сохранить, статус: " << st << "\n";
+            }
+        }
+
+        void do_load_config() {
+            int st = builder_.load(kConfigPath);
+
+            if (st == 0x00) {
+                std::cout << "Загружено из " << kConfigPath << "\n";
+            } else if (st == 0x03) {
+                std::cout << "Файл " << kConfigPath << " не открылся\n";
+            } else {
+                std::cout << "Ошибка чтения, статус: " << st << "\n";
+            }
+        }
+
         void handle(int choice) {
             switch (choice) {
                 case 1:  do_read_terminal(); break;
@@ -250,6 +261,8 @@ class tui_t {
                 case 10: do_write_command(); break;
                 case 11: do_run();           break;
                 case 12: do_run_file();      break;
+                case 13: do_save_config();   break;
+                case 14: do_load_config();   break;
                 case 0:  running_ = false;   break;
                 default: std::cout << "Нет такого пункта\n"; break;
             }
@@ -265,6 +278,9 @@ class tui_t {
          * Возвращает управление после выбора пункта 0 или при EOF.
          */
         void run() {
+            // Если конфиг уже есть — подхватить его при старте.
+            builder_.load(kConfigPath);
+
             while (running_) {
                 print_menu();
 

@@ -25,9 +25,9 @@
  * m.set_source_file("main.cpp");
  * m.set_output_file("main.exe");
  * m.set_optimization("-Os");
- * m.build_args();          // args_ = { "g++", "-Os", "main.cpp", "-o", "main.exe" }
- * m.build_command(m.args()); // command_ = "g++ -Os main.cpp -o main.exe"
- * m.run();                 // выполняет command_
+ * m.build_args();                 // args_ = { "g++", "-Os", "main.cpp", "-o", "main.exe" }
+ * m.build_command(m.args());      // command_ = "g++ -Os main.cpp -o main.exe"
+ * m.run();                        // выполняет command_
  * @endcode
  *
  * Соглашение о кодах возврата:
@@ -61,11 +61,6 @@ class make_t {
         std::vector<std::string> args_;  ///< Аргументы командной строки.
         std::string command_;            ///< Склеенная строка команды.
 
-        /**
-         * @brief Преобразовать значение enum компилятора в имя исполняемого файла.
-         * @param c Значение компилятора.
-         * @return Имя исполняемого файла ("gcc", "g++", "clang") либо "unknown".
-         */
         static std::string compiler_to_string(compiler c) {
             switch (c) {
                 case compiler::GCC:   return "gcc";
@@ -73,6 +68,12 @@ class make_t {
                 case compiler::CLANG: return "clang";
             }
             return "unknown";
+        }
+
+        static compiler string_to_compiler(const std::string& s) {
+            if (s == "GCC")   return compiler::GCC;
+            if (s == "CLANG") return compiler::CLANG;
+            return compiler::GPP;
         }
 
     public:
@@ -88,11 +89,13 @@ class make_t {
         void set_optimization(const std::string& v) { cfg_.optimization  = v; }
         /// @}
 
+        /// @brief Доступ к текущей конфигурации.
+        const config_t& config() const { return cfg_; }
+
         /**
          * @brief Пересобрать @ref args_ из @ref cfg_.
          *
          * Порядок: `<compiler> [optimization] [source_file] [-o output_file]`.
-         * Пустые необязательные поля пропускаются.
          *
          * @return @c 0x00 при успехе.
          */
@@ -146,7 +149,6 @@ class make_t {
                 if (i > 0) {
                     command_ += sep;
                 }
-
                 command_ += v[i];
             }
 
@@ -158,13 +160,8 @@ class make_t {
             return command_;
         }
 
-        // ------------------------------------------------------------------
-        // Сохранение через внешний write_t (переиспользуемый объект)
-        // ------------------------------------------------------------------
-
         /**
-         * @brief Записать аргументы (@ref args_) через переданный @p out.
-         * @param out Готовый объект @ref write_t.
+         * @brief Записать аргументы через переданный @p out.
          * @return Код возврата @ref write_t.
          */
         int write_args(write_t& out) const {
@@ -172,17 +169,12 @@ class make_t {
         }
 
         /**
-         * @brief Записать строку команды (@ref command_) через @p out.
-         * @param out Готовый объект @ref write_t.
+         * @brief Записать строку команды через @p out.
          * @return Код возврата @ref write_t.
          */
         int write_command(write_t& out) const {
             return out.write(command_);
         }
-
-        // ------------------------------------------------------------------
-        // Выполнение
-        // ------------------------------------------------------------------
 
         /**
          * @brief Выполнить уже собранную команду из @ref command_.
@@ -208,13 +200,8 @@ class make_t {
 
         /**
          * @brief Прочитать команду из файла и выполнить её.
-         *
-         * Берётся первая непустая строка файла.
-         *
-         * @param path Путь к файлу с командой.
-         * @return @c 0x00 при успехе, @c 0x02 при ошибке выполнения,
-         *         @c 0x03 если файл не открылся, @c 0x04 если файл пуст,
-         *         @c 0x05 при ошибке чтения.
+         * @param path Путь к файлу с командой (берётся первая непустая строка).
+         * @return @c 0x00 / @c 0x02 / @c 0x03 / @c 0x04 / @c 0x05.
          */
         int run_file(const std::string& path) {
             read_t reader;
@@ -243,6 +230,89 @@ class make_t {
             if (rc != 0) {
                 std::cerr << "make_t: command failed, rc = " << rc << '\n';
                 return 0x02;
+            }
+
+            return 0x00;
+        }
+
+        // ------------------------------------------------------------------
+        // Сериализация конфигурации
+        // ------------------------------------------------------------------
+
+        /**
+         * @brief Записать конфигурацию в файл в формате key=value.
+         *
+         * Внимание: строки-комментарии начинаются с '#'. Пустые строки
+         * в файле не допускаются — @ref read_t::read() остановится на
+         * первой пустой строке.
+         *
+         * @param path Путь к файлу конфигурации.
+         * @return @c 0x00 при успехе, @c 0x03 если файл не открылся,
+         *         @c 0x02 при ошибке записи.
+         */
+        int save(const std::string& path) const {
+            std::vector<std::string> lines = {
+                "# make_t config; no empty lines",
+                "language="     + cfg_.language,
+                "compiler="     + std::string(compiler_to_string(cfg_.compiler_kind) == "g++"   ? "GPP" :
+                                              compiler_to_string(cfg_.compiler_kind) == "gcc"   ? "GCC" :
+                                                                                                  "CLANG"),
+                "source_file="  + cfg_.source_file,
+                "output_file="  + cfg_.output_file,
+                "optimization=" + cfg_.optimization,
+            };
+
+            write_t w(path);
+            if (w.status() != 0x00) {
+                return 0x03;
+            }
+            return w.write(lines);
+        }
+
+        /**
+         * @brief Прочитать конфигурацию из файла в формате key=value.
+         *
+         * Неизвестные ключи игнорируются. Отсутствующие ключи оставляют
+         * текущее значение поля без изменений.
+         *
+         * @param path Путь к файлу конфигурации.
+         * @return @c 0x00 / @c 0x03 / @c 0x05.
+         */
+        int load(const std::string& path) {
+            read_t reader;
+            int st = reader.read(path);
+
+            if (st == 0x04) {
+                return 0x03;
+            }
+            if (st == 0x03) {
+                return 0x05;
+            }
+
+            for (const auto& line : reader.data()) {
+                if (line.empty() || line[0] == '#') {
+                    continue;
+                }
+
+                const auto eq = line.find('=');
+                if (eq == std::string::npos) {
+                    continue;
+                }
+
+                const std::string key   = line.substr(0, eq);
+                const std::string value = line.substr(eq + 1);
+
+                if (key == "language") {
+                    cfg_.language = value;
+                } else if (key == "compiler") {
+                    cfg_.compiler_kind = string_to_compiler(value);
+                } else if (key == "source_file") {
+                    cfg_.source_file = value;
+                } else if (key == "output_file") {
+                    cfg_.output_file = value;
+                } else if (key == "optimization") {
+                    cfg_.optimization = value;
+                }
             }
 
             return 0x00;
