@@ -13,19 +13,9 @@
 
 /**
  * @file TUI.hpp
- * @brief Интерактивная настройка параметров и запуск сборки.
+ * @brief Интерактивная настройка с проверками и пояснениями флагов.
  */
 
-/**
- * @class tui_t
- * @brief Меню: конфигурация из config/*.txt и запуск компилятора.
- *
- * Пользователь настраивает параметры, выбирая значения из каталога
- * (файлы config/*.txt). После настройки — «Собрать» формирует команду
- * и запускает её через std::system.
- *
- * Завершение: пункт 0 или EOF (Ctrl+Z / Ctrl+D).
- */
 class tui_t {
     private:
         enum class input_result { ok, cancelled, eof };
@@ -34,10 +24,7 @@ class tui_t {
         flag_catalog_t catalog_;
         bool running_ = true;
 
-        // ------------------------------------------------------------------
-        // Хелперы ввода
-        // ------------------------------------------------------------------
-
+        // ---------- Ввод ----------
         static input_result ask_line(const std::string& prompt,
                                      std::string& out,
                                      bool allow_empty = false)
@@ -58,19 +45,14 @@ class tui_t {
                 try {
                     std::size_t pos = 0;
                     int v = std::stoi(s, &pos);
-                    if (pos != s.size()) {
-                        std::cout << "  Не число\n";
-                        continue;
-                    }
-                    if (v < min || v > max) {
-                        std::cout << "  Вне диапазона " << min
-                                  << ".." << max << '\n';
+                    if (pos != s.size() || v < min || v > max) {
+                        std::cout << "  Введите число от " << min << " до " << max << '\n';
                         continue;
                     }
                     out = v;
                     return input_result::ok;
                 } catch (...) {
-                    std::cout << "  Не число\n";
+                    std::cout << "  Введите число от " << min << " до " << max << '\n';
                 }
             }
         }
@@ -80,24 +62,14 @@ class tui_t {
                 std::string s;
                 auto r = ask_line(prompt + " [y/n]: ", s);
                 if (r != input_result::ok) return r;
-                if (s == "y" || s == "Y" || s == "yes" || s == "да") {
-                    out = true;  return input_result::ok;
-                }
-                if (s == "n" || s == "N" || s == "no" || s == "нет") {
-                    out = false; return input_result::ok;
-                }
+                if (s == "y" || s == "Y" || s == "yes" || s == "да") { out = true; return input_result::ok; }
+                if (s == "n" || s == "N" || s == "no" || s == "нет") { out = false; return input_result::ok; }
                 std::cout << "  Введите y или n\n";
             }
         }
 
-        // ------------------------------------------------------------------
-        // Форматирование для заголовка
-        // ------------------------------------------------------------------
-
-        static std::string disp(const std::string& v) {
-            return v.empty() ? "(не задано)" : v;
-        }
-
+        // ---------- Отображение ----------
+        static std::string disp(const std::string& v) { return v.empty() ? "(не задано)" : v; }
         static std::string disp_list(const std::vector<std::string>& v) {
             if (v.empty()) return "(не задано)";
             std::string s;
@@ -107,70 +79,6 @@ class tui_t {
             }
             return s;
         }
-
-        // ------------------------------------------------------------------
-        // Выбор из каталога
-        // ------------------------------------------------------------------
-
-        /// @brief Выбор одного значения. Возвращает -1 при отмене,
-        ///        0 — «не задано», 1..N — индекс в g.flags.
-        int select_single_from(const flag_group_t& g,
-                               const std::string& current)
-        {
-            if (g.flags.empty()) {
-                std::cout << "  Нет опций (проверьте config/" << g.name << ".txt)\n";
-                return -1;
-            }
-
-            std::cout << " 0. (не задано)\n";
-            for (std::size_t i = 0; i < g.flags.size(); ++i) {
-                std::cout << " " << (i + 1) << ". " << g.flags[i];
-                if (g.flags[i] == current) std::cout << "  <- текущее";
-                std::cout << '\n';
-            }
-
-            int choice = -1;
-            auto r = ask_int("Выбор: ", 0, static_cast<int>(g.flags.size()), choice);
-            if (r != input_result::ok) return -1;
-            return choice;
-        }
-
-        /// @brief Цикл переключения для multi-группы.
-        ///        Модифицирует @p current. Возвращает ok при «0. Готово»,
-        ///        cancelled/eof — при отмене (изменения НЕ применяются).
-        input_result select_multi_from(const flag_group_t& g,
-                                       std::vector<std::string>& current)
-        {
-            if (g.flags.empty()) {
-                std::cout << "  Нет опций (проверьте config/" << g.name << ".txt)\n";
-                return input_result::cancelled;
-            }
-
-            while (true) {
-                std::cout << "\n" << g.title
-                          << " (0 - готово, пусто - отмена):\n";
-                for (std::size_t i = 0; i < g.flags.size(); ++i) {
-                    const bool on = std::find(current.begin(), current.end(),
-                                              g.flags[i]) != current.end();
-                    std::cout << " [" << (on ? "x" : " ") << "] "
-                              << (i + 1) << ". " << g.flags[i] << '\n';
-                }
-
-                int choice = -1;
-                auto r = ask_int("Toggle: ", 0, static_cast<int>(g.flags.size()), choice);
-                if (r != input_result::ok) return r;
-                if (choice == 0) return input_result::ok;
-
-                const std::string& flag = g.flags[choice - 1];
-                auto it = std::find(current.begin(), current.end(), flag);
-                if (it != current.end()) current.erase(it);
-                else                     current.push_back(flag);
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // Заголовок и меню
-        // ------------------------------------------------------------------
 
         void print_header() const {
             const auto& c = builder_.config();
@@ -209,16 +117,81 @@ class tui_t {
                       << " 0. Выход\n";
         }
 
-        // ------------------------------------------------------------------
-        // Действия (single-группы)
-        // ------------------------------------------------------------------
+        // ---------- Выбор с пояснениями ----------
+        int select_single_from(const flag_group_t& g, const std::string& current) {
+            if (g.entries.empty()) {
+                std::cout << "  Нет опций (проверьте config/" << g.name << ".txt)\n";
+                return -1;
+            }
 
+            std::cout << " 0. (не задано / оставить текущее)\n";
+            for (std::size_t i = 0; i < g.entries.size(); ++i) {
+                std::cout << " " << (i + 1) << ". " << g.entries[i].flag;
+                if (!g.entries[i].description.empty()) {
+                    std::cout << "  -- " << g.entries[i].description;
+                }
+                if (g.entries[i].flag == current) std::cout << "  <- текущее";
+                std::cout << '\n';
+            }
+
+            int choice = -1;
+            auto r = ask_int("Выбор: ", 0, static_cast<int>(g.entries.size()), choice);
+            if (r != input_result::ok) return -1;
+            return choice;
+        }
+
+        input_result select_multi_from(const flag_group_t& g, std::vector<std::string>& current) {
+            if (g.entries.empty()) {
+                std::cout << "  Нет опций (проверьте config/" << g.name << ".txt)\n";
+                return input_result::cancelled;
+            }
+
+            while (true) {
+                std::cout << "\n" << g.title << " (0 - готово, пусто - отмена):\n";
+                for (std::size_t i = 0; i < g.entries.size(); ++i) {
+                    bool on = std::find(current.begin(), current.end(), g.entries[i].flag) != current.end();
+                    std::cout << " [" << (on ? "x" : " ") << "] " << (i + 1) << ". " << g.entries[i].flag;
+                    if (!g.entries[i].description.empty()) {
+                        std::cout << "  -- " << g.entries[i].description;
+                    }
+                    std::cout << '\n';
+                }
+
+                int choice = -1;
+                auto r = ask_int("Toggle: ", 0, static_cast<int>(g.entries.size()), choice);
+                if (r != input_result::ok) return r;
+                if (choice == 0) return input_result::ok;
+
+                const std::string& flag = g.entries[choice - 1].flag;
+                auto it = std::find(current.begin(), current.end(), flag);
+                if (it != current.end()) current.erase(it);
+                else                     current.push_back(flag);
+            }
+        }
+
+        // ---------- Действия ----------
         void do_compiler() {
             auto* g = catalog_.find("compiler");
             if (!g) return;
             int choice = select_single_from(*g, builder_.config().compiler);
             if (choice < 0) return;
-            builder_.set_compiler(choice == 0 ? "g++" : g->flags[choice - 1]);
+            std::string val = (choice == 0) ? "g++" : g->entries[choice - 1].flag;
+
+            // Проверка наличия в PATH (эвристика через system)
+            std::string check_cmd = "where " + val + " >nul 2>nul";
+#ifdef __linux__
+            check_cmd = "command -v " + val + " >/dev/null 2>&1";
+#endif
+            if (std::system(check_cmd.c_str()) != 0) {
+                std::cout << "  ВНИМАНИЕ: '" << val << "' не найден в PATH\n";
+                bool cont = false;
+                if (ask_yesno("Всё равно использовать?", cont) != input_result::ok || !cont) {
+                    std::cout << "  Отменено\n";
+                    return;
+                }
+            }
+
+            builder_.set_compiler(val);
         }
 
         void do_standard() {
@@ -226,7 +199,7 @@ class tui_t {
             if (!g) return;
             int choice = select_single_from(*g, builder_.config().standard);
             if (choice < 0) return;
-            builder_.set_standard(choice == 0 ? "" : g->flags[choice - 1]);
+            builder_.set_standard(choice == 0 ? "" : g->entries[choice - 1].flag);
         }
 
         void do_optimization() {
@@ -234,7 +207,7 @@ class tui_t {
             if (!g) return;
             int choice = select_single_from(*g, builder_.config().optimization);
             if (choice < 0) return;
-            builder_.set_optimization(choice == 0 ? "" : g->flags[choice - 1]);
+            builder_.set_optimization(choice == 0 ? "" : g->entries[choice - 1].flag);
         }
 
         void do_debug() {
@@ -242,7 +215,7 @@ class tui_t {
             if (!g) return;
             int choice = select_single_from(*g, builder_.config().debug);
             if (choice < 0) return;
-            builder_.set_debug(choice == 0 ? "" : g->flags[choice - 1]);
+            builder_.set_debug(choice == 0 ? "" : g->entries[choice - 1].flag);
         }
 
         void do_lto() {
@@ -250,7 +223,7 @@ class tui_t {
             if (!g) return;
             int choice = select_single_from(*g, builder_.config().lto);
             if (choice < 0) return;
-            builder_.set_lto(choice == 0 ? "" : g->flags[choice - 1]);
+            builder_.set_lto(choice == 0 ? "" : g->entries[choice - 1].flag);
         }
 
         void do_arch() {
@@ -258,12 +231,8 @@ class tui_t {
             if (!g) return;
             int choice = select_single_from(*g, builder_.config().arch);
             if (choice < 0) return;
-            builder_.set_arch(choice == 0 ? "" : g->flags[choice - 1]);
+            builder_.set_arch(choice == 0 ? "" : g->entries[choice - 1].flag);
         }
-
-        // ------------------------------------------------------------------
-        // Действия (multi-группы)
-        // ------------------------------------------------------------------
 
         void do_warnings() {
             auto* g = catalog_.find("warnings");
@@ -279,6 +248,22 @@ class tui_t {
             if (!g) return;
             std::vector<std::string> current = builder_.config().sanitizers;
             if (select_multi_from(*g, current) == input_result::ok) {
+                // Проверка на несовместимость после выбора
+                auto has = [&current](const std::string& s) {
+                    return std::find(current.begin(), current.end(), s) != current.end();
+                };
+                if (has("-fsanitize=address") && has("-fsanitize=thread")) {
+                    std::cout << "  ОШИБКА: address и thread несовместимы. Изменения отменены.\n";
+                    return;
+                }
+                if (has("-fsanitize=address") && has("-fsanitize=memory")) {
+                    std::cout << "  ОШИБКА: address и memory несовместимы. Изменения отменены.\n";
+                    return;
+                }
+                if (has("-fsanitize=thread") && has("-fsanitize=leak")) {
+                    std::cout << "  ОШИБКА: thread и leak несовместимы. Изменения отменены.\n";
+                    return;
+                }
                 builder_.set_sanitizers(current);
             }
         }
@@ -301,10 +286,6 @@ class tui_t {
             }
         }
 
-        // ------------------------------------------------------------------
-        // Пути (свободный ввод)
-        // ------------------------------------------------------------------
-
         void do_source_file() {
             std::cout << "Текущий: " << disp(builder_.config().source_file) << '\n';
             std::string v;
@@ -313,6 +294,14 @@ class tui_t {
             if (v.find_first_of(";|&`$<>\"") != std::string::npos) {
                 std::cout << "  Недопустимые символы\n";
                 return;
+            }
+            if (!std::filesystem::exists(v)) {
+                std::cout << "  ВНИМАНИЕ: файл не найден\n";
+                bool cont = false;
+                if (ask_yesno("Всё равно использовать?", cont) != input_result::ok || !cont) {
+                    std::cout << "  Отменено\n";
+                    return;
+                }
             }
             builder_.set_source_file(v);
         }
@@ -329,17 +318,13 @@ class tui_t {
             builder_.set_output_file(v);
         }
 
-        // ------------------------------------------------------------------
-        // Сборка
-        // ------------------------------------------------------------------
-
         void do_show_command() {
             if (builder_.config().source_file.empty()) {
                 std::cout << "Сначала задайте исходный файл (п. 11)\n";
                 return;
             }
             if (builder_.build_args() != 0x00) {
-                std::cout << "Ошибка конфигурации\n";
+                std::cout << "Ошибка конфигурации (подробности выше)\n";
                 return;
             }
             builder_.build_command(builder_.args());
@@ -359,11 +344,12 @@ class tui_t {
             }
 
             if (builder_.build_args() != 0x00) {
-                std::cout << "Ошибка конфигурации\n";
+                std::cout << "Ошибка конфигурации (подробности выше)\n";
                 return;
             }
             builder_.build_command(builder_.args());
 
+            // Проверка существования исходника
             if (!std::filesystem::exists(builder_.config().source_file)) {
                 std::cout << "  ВНИМАНИЕ: исходный файл не найден\n";
                 bool cont = false;
@@ -373,11 +359,17 @@ class tui_t {
                 }
             }
 
+            // Создание каталога для выходного файла
             if (!builder_.config().output_file.empty()) {
-                auto parent = std::filesystem::path(
-                    builder_.config().output_file).parent_path();
+                auto parent = std::filesystem::path(builder_.config().output_file).parent_path();
                 if (!parent.empty() && !std::filesystem::exists(parent)) {
-                    std::filesystem::create_directories(parent);
+                    std::error_code ec;
+                    std::filesystem::create_directories(parent, ec);
+                    if (ec) {
+                        std::cout << "  ОШИБКА: не удалось создать каталог " << parent
+                                  << ": " << ec.message() << '\n';
+                        return;
+                    }
                 }
             }
 
@@ -418,10 +410,20 @@ class tui_t {
         tui_t() = default;
         ~tui_t() = default;
 
-        /// @brief Запустить меню.
         void run() {
-            std::filesystem::create_directories("build");
-            catalog_.load("config");
+            // Проверка и создание build/ с обработкой ошибок
+            std::error_code ec;
+            std::filesystem::create_directories("build", ec);
+            if (ec) {
+                std::cerr << "Не удалось создать build/: " << ec.message() << '\n';
+                return;
+            }
+
+            // Загрузка каталога
+            if (catalog_.load("config") != 0x00) {
+                std::cerr << "Не удалось загрузить ни одного файла из config/\n";
+                return;
+            }
 
             while (running_) {
                 print_menu();
@@ -441,4 +443,4 @@ class tui_t {
         }
 };
 
-#endif // TUI_HPP
+#endif // TUI.hpp

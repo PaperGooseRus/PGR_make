@@ -1,9 +1,7 @@
-# Санитайзеры. Можно выбирать несколько (multi-группа),
-# КРОМЕ несовместимых пар (address + thread, memory + address).
--fsanitize=address
--fsanitize=undefined
--fsanitize=leak
--fsanitize=thread
--fsanitize=memory
--fno-omit-frame-pointer
--fno-sanitize-recover=all
+-fsanitize=address|AddressSanitizer: ошибки работы с памятью (use-after-free и т.п.)
+-fsanitize=undefined|UndefinedBehaviorSanitizer: неопределённое поведение
+-fsanitize=leak|LeakSanitizer: утечки памяти (несовместим с thread)
+-fsanitize=thread|ThreadSanitizer: гонки данных (несовместим с address, leak, memory)
+-fsanitize=memory|MemorySanitizer: неинициализированная память (только Clang, несовместим с address)
+-fno-omit-frame-pointer|Сохраняет указатель стека (улучшает отчёты санитайзеров)
+-fno-sanitize-recover=all|Останавливаться при первой ошибке санитайзера

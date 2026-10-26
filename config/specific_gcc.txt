@@ -1,8 +1,5 @@
-# Флаги, которые понимает ТОЛЬКО GCC.
-# Не передаются в clang: он упадёт с "unsupported option".
-# (пусто = не добавлять флаг)
--fno-declone-ctor-dtor
--fipa-pure-const
--fipa-cp-clone
--fhardened
--fanalyzer
+-fno-declone-ctor-dtor|Обход бага GCC 16 (GCC Bug 125359)
+-fipa-pure-const|Межпроцедурный анализ чистых функций (только GCC)
+-fipa-cp-clone|Клонирование функций при межпроцедурной оптимизации (только GCC)
+-fhardened|Включает набор защитных механизмов (только новые GCC)
+-fanalyzer|Статический анализатор кода (только GCC)

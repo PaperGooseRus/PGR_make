@@ -1,5 +1,2 @@
-# Link-Time Optimization. Ровно один (single-группа).
-# (пусто = не добавлять флаг)
--flto
--flto=thin
--flto=full
+-flto|Link-Time Optimization (межмодульная оптимизация)
+-flto=thin|ThinLTO (быстрее, чем полный LTO, поддерживается GCC и Clang)

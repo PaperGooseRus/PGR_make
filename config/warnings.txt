@@ -1,16 +1,14 @@
-# Предупреждения. Можно выбирать несколько (multi-группа).
-# Каждый выбранный флаг добавляется в командную строку отдельно.
--Wall
--Wextra
--Wpedantic
--Wshadow
--Wconversion
--Wsign-conversion
--Wcast-qual
--Wold-style-cast
--Wnon-virtual-dtor
--Woverloaded-virtual
--Wnull-dereference
--Wdouble-promotion
--Wformat=2
--Werror
+-Wall|Включает основной набор предупреждений
+-Wextra|Дополнительные предупреждения (выходят за рамки -Wall)
+-Wpedantic|Строгое соответствие стандарту ISO C++
+-Wshadow|Предупреждает о перекрытии имён переменных
+-Wconversion|Предупреждает о неявных преобразованиях типов
+-Wsign-conversion|Предупреждает о преобразованиях со знаком/без знака
+-Wcast-qual|Предупреждает об опасных приведениях типов
+-Wold-style-cast|Предупреждает о C-подобных приведениях типов
+-Wnon-virtual-dtor|Предупреждает о невиртуальных деструкторах
+-Woverloaded-virtual|Предупреждает о перекрытии виртуальных функций
+-Wnull-dereference|Предупреждает о разыменовании nullptr
+-Wdouble-promotion|Предупреждает о неявном повышении float до double
+-Wformat=2|Строгая проверка форматов printf/scanf
+-Werror|Превращает все предупреждения в ошибки
