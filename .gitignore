@@ -1,3 +1,12 @@
+# Build outputs and generated CMake staging
 build/
+build_*/
+build-*/
+build-review/
 build_cmake/
-project/
+project/generated_cmake/
+project/work.log
+compile_commands.json
+*.o
+*.obj
+*.exe

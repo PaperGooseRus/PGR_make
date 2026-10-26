@@ -20,6 +20,8 @@
 #include "cmake_writer.hpp"
 #include "log_t.hpp"
 #include "make.hpp"
+#include "process_runner.hpp"
+#include "safe_paths.hpp"
 #include "read.hpp"
 #include "tree.hpp"
 #include "write.hpp"
@@ -28,12 +30,16 @@
  * @file TUI.hpp
  * @brief Меню конфигурации, генерации CMakeLists.txt и запуска сборки.
  *
- * UX-улучшения:
+ * UX:
  *  - полная перерисовка экрана после каждого действия;
- *  - компактная сводка в шапке (одна строка вместо 15);
- *  - значения флагов встроены в пункты меню;
+ *  - компактная сводка в шапке;
  *  - статус-строка с результатом последнего действия;
- *  - группы: Настройки / Действия / Выход, разделители.
+ *  - группы: настройки / действия / пакеты / сервис / выход.
+ *
+ * Персистентность:
+ *  - project/config.cfg — сохранённые флаги (auto-load, auto-save);
+ *  - project/profiles/NAME.cfg — альтернативные профили;
+ *  - project/work.log — журнал (append, с timestamp).
  */
 class tui_t {
     private:
@@ -44,19 +50,19 @@ class tui_t {
         log_t log_;
         bool running_ = true;
 
-        std::string status_;             ///< Текст статуса для следующей отрисовки.
-        bool status_is_error_ = false;   ///< Статус — ошибка ([!] вместо [ ]).
+        std::string status_;
+        bool status_is_error_ = false;
 
-        static constexpr const char* kConfigPath = "project/config.cfg";
-        static constexpr const char* kLogPath    = "project/work.log";
-        static constexpr const char* kTitle      = "PGR_make";
+        static constexpr const char* kConfigPath  = "project/config.cfg";
+        static constexpr const char* kLogPath     = "project/work.log";
+        static constexpr const char* kProfilesDir = "project/profiles";
+        static constexpr const char* kTitle       = "PGR_make";
 
         // ------------------------------------------------------------------
         // Экран
         // ------------------------------------------------------------------
 
 #ifdef _WIN32
-        /// @brief Очистка экрана через Win32 (быстро, без мерцания).
         static void clear_screen() {
             HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
             CONSOLE_SCREEN_BUFFER_INFO info;
@@ -72,20 +78,17 @@ class tui_t {
             SetConsoleCursorPosition(h, origin);
         }
 #else
-        /// @brief Очистка экрана через ANSI.
         static void clear_screen() {
             std::cout << "\033[2J\033[H" << std::flush;
         }
 #endif
 
-        /// @brief Пауза до Enter (для длинного вывода перед перерисовкой).
         static void wait_enter() {
             std::cout << "\n-- Enter --" << std::flush;
             std::string line;
             std::getline(std::cin, line);
         }
 
-        /// @brief Ширина строки в печатных столбцах (UTF-8 aware).
         static std::size_t display_width(const std::string& s) {
             std::size_t w = 0;
             for (std::size_t i = 0; i < s.size(); ) {
@@ -99,7 +102,6 @@ class tui_t {
             return w;
         }
 
-        /// @brief Дополнить строку пробелами справа до display_width = width.
         static std::string pad_right(const std::string& s, std::size_t width) {
             const std::size_t w = display_width(s);
             if (w >= width) return s;
@@ -116,7 +118,7 @@ class tui_t {
         }
 
         // ------------------------------------------------------------------
-        // Отображение значений
+        // Отображение
         // ------------------------------------------------------------------
 
         static std::string disp(const std::string& v) {
@@ -133,15 +135,13 @@ class tui_t {
             return s;
         }
 
-        // ------------------------------------------------------------------
-        // Шапка и меню
-        // ------------------------------------------------------------------
-
         void print_summary_line() const {
             const auto& c = builder_.config();
 
             print_sep('=', 74);
-            std::cout << " " << kTitle << '\n';
+            std::string title = std::string(kTitle);
+            if (!c.profile.empty()) title += "  [" + c.profile + "]";
+            std::cout << " " << title << '\n';
             print_sep('=', 74);
 
             std::string s;
@@ -158,13 +158,14 @@ class tui_t {
             if (!c.lto.empty())  append(c.lto);
             if (!c.arch.empty()) append(c.arch);
 
-            const std::size_t extra =
+            const std::size_t flags =
                 c.warnings.size() + c.sanitizers.size()
               + c.specific_gcc.size() + c.specific_clang.size()
               + c.include_dirs.size() + c.library_dirs.size()
               + c.libraries.size();
-            if (extra > 0) append("opt:" + std::to_string(extra));
-
+            if (flags > 0) append("opt:" + std::to_string(flags));
+            if (!c.packages.empty())
+                append("pkg:" + std::to_string(c.packages.size()));
             if (!c.source_files.empty())
                 append("src:" + std::to_string(c.source_files.size()));
 
@@ -174,7 +175,9 @@ class tui_t {
 
         void print_status_line() {
             if (status_.empty()) return;
-            std::cout << " Статус: " << (status_is_error_ ? "[!] " : "") << status_ << '\n';
+            std::cout << " Статус: "
+                      << (status_is_error_ ? "[!] " : "")
+                      << status_ << '\n';
             status_.clear();
             status_is_error_ = false;
         }
@@ -214,6 +217,17 @@ class tui_t {
             print_row(19, "Собрать через CMake");
             print_row(20, "Сохранить конфиг");
             print_row(21, "Загрузить конфиг");
+
+            print_sep('-', 74);
+
+            print_row(22, "Пакеты (find_package)", disp_list(c.packages));
+            print_row(23, "Профиль",               disp(c.profile));
+            print_row(24, "Очистить build_cmake");
+            print_row(25, "compile_commands.json → корень");
+            print_row(26, "Toolchain file (CMake)", disp(c.toolchain_file));
+            print_row(27, "Стандарт C", disp(c.c_standard));
+            print_row(28, "Linker script (.ld)", disp(c.linker_script));
+            print_row(29, "Тип библиотек", disp(c.target_type));
 
             print_sep('-', 74);
             print_row(0,  "Выход");
@@ -280,7 +294,7 @@ class tui_t {
         }
 
         // ------------------------------------------------------------------
-        // Редактор списка (sub-меню, без перерисовки — чтобы видеть изменения)
+        // Редактор списка строк
         // ------------------------------------------------------------------
 
         void edit_string_list(const std::string& title,
@@ -367,7 +381,7 @@ class tui_t {
         }
 
         // ------------------------------------------------------------------
-        // Выбор из каталога
+        // Выбор из каталога флагов
         // ------------------------------------------------------------------
 
         int select_single_from(const flag_group_t& g,
@@ -377,7 +391,7 @@ class tui_t {
                 std::cout << "  Нет опций (config/" << g.name << ".txt)\n";
                 return -1;
             }
-            std::cout << " 0. (не задано / оставить текущее)\n";
+            std::cout << " 0. (сбросить значение)\n";
             for (std::size_t i = 0; i < g.entries.size(); ++i) {
                 std::cout << " " << (i + 1) << ". " << g.entries[i].flag;
                 if (!g.entries[i].description.empty())
@@ -426,7 +440,7 @@ class tui_t {
         }
 
         // ------------------------------------------------------------------
-        // Действия: single-группы
+        // Действия: single-группы (1-8)
         // ------------------------------------------------------------------
 
         void do_compiler() {
@@ -436,11 +450,7 @@ class tui_t {
             if (choice < 0) return;
             std::string val = (choice == 0) ? "g++" : g->entries[choice - 1].flag;
 
-            std::string check_cmd = "where " + val + " >nul 2>nul";
-#ifdef __linux__
-            check_cmd = "command -v " + val + " >/dev/null 2>&1";
-#endif
-            if (std::system(check_cmd.c_str()) != 0) {
+            if (!pgr_process::available(val)) {
                 std::cout << "  ВНИМАНИЕ: '" << val << "' не найден в PATH\n";
                 bool cont = false;
                 if (ask_yesno("Всё равно использовать?", cont)
@@ -487,32 +497,6 @@ class tui_t {
             set_status("Отладка: " + disp(v));
         }
 
-        void do_lto() {
-            auto* g = catalog_.find("lto");
-            if (!g) return;
-            int c = select_single_from(*g, builder_.config().lto);
-            if (c < 0) return;
-            std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
-            builder_.set_lto(v);
-            log_.write("[set] lto=" + (v.empty() ? "(none)" : v));
-            set_status("LTO: " + disp(v));
-        }
-
-        void do_arch() {
-            auto* g = catalog_.find("arch");
-            if (!g) return;
-            int c = select_single_from(*g, builder_.config().arch);
-            if (c < 0) return;
-            std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
-            builder_.set_arch(v);
-            log_.write("[set] arch=" + (v.empty() ? "(none)" : v));
-            set_status("Архитектура: " + disp(v));
-        }
-
-        // ------------------------------------------------------------------
-        // Действия: multi-группы
-        // ------------------------------------------------------------------
-
         void do_warnings() {
             auto* g = catalog_.find("warnings");
             if (!g) return;
@@ -553,6 +537,32 @@ class tui_t {
             }
         }
 
+        void do_lto() {
+            auto* g = catalog_.find("lto");
+            if (!g) return;
+            int c = select_single_from(*g, builder_.config().lto);
+            if (c < 0) return;
+            std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
+            builder_.set_lto(v);
+            log_.write("[set] lto=" + (v.empty() ? "(none)" : v));
+            set_status("LTO: " + disp(v));
+        }
+
+        void do_arch() {
+            auto* g = catalog_.find("arch");
+            if (!g) return;
+            int c = select_single_from(*g, builder_.config().arch);
+            if (c < 0) return;
+            std::string v = (c == 0) ? "" : g->entries[c - 1].flag;
+            builder_.set_arch(v);
+            log_.write("[set] arch=" + (v.empty() ? "(none)" : v));
+            set_status("Архитектура: " + disp(v));
+        }
+
+        // ------------------------------------------------------------------
+        // Действия: специфичные флаги (9-10)
+        // ------------------------------------------------------------------
+
         void do_specific_gcc() {
             auto* g = catalog_.find("specific_gcc");
             if (!g) return;
@@ -576,7 +586,7 @@ class tui_t {
         }
 
         // ------------------------------------------------------------------
-        // Действия: пути и библиотеки
+        // Действия: пути и библиотеки (11-15)
         // ------------------------------------------------------------------
 
         void do_source_files() {
@@ -633,7 +643,7 @@ class tui_t {
         }
 
         // ------------------------------------------------------------------
-        // Действия: команда и сборка (с wait_enter)
+        // Действия: показать команду / собрать g++ (16-17)
         // ------------------------------------------------------------------
 
         void do_show_command() {
@@ -709,7 +719,9 @@ class tui_t {
             }
 
             std::cout << '\n';
-            int rc = builder_.run();
+            int rc = builder_.run([this](const std::string& line) {
+                log_.write("[gpp] " + line);
+            });
             log_.write("[gpp] rc=" + std::to_string(rc));
 
             if (rc == 0x00) set_status("Сборка (g++): успех");
@@ -718,7 +730,7 @@ class tui_t {
         }
 
         // ------------------------------------------------------------------
-        // Действия: CMake
+        // Действия: CMake (18-19)
         // ------------------------------------------------------------------
 
         void do_generate_cmake() {
@@ -730,6 +742,12 @@ class tui_t {
             opts.exclude_dirs = {"build", "build_cmake", ".git", ".vs",
                                  ".vscode", "obj", "bin", "out", "project"};
             opts.project_name = "PGR_make";
+            opts.include_roots = builder_.config().include_dirs;
+            // Белый список: если source_files заданы в конфиге — уважать.
+            // Если пусто — сканировать всё дерево.
+            if (!builder_.config().source_files.empty()) {
+                opts.only_sources = builder_.config().source_files;
+            }
             tree.set_options(opts);
 
             if (tree.scan() != 0x00) {
@@ -740,25 +758,30 @@ class tui_t {
 
             const auto cyc = tree.cycles();
             if (!cyc.empty()) {
-                std::string cyc_str;
-                std::cout << "ОБНАРУЖЕНЫ ЦИКЛЫ:\n";
-                for (const auto& c : cyc) {
-                    std::cout << "  ";
-                    for (const auto& m : c) {
-                        std::cout << (m.empty() ? "." : m) << " ";
-                        cyc_str += (m.empty() ? "." : m) + std::string(" ");
-                    }
-                    std::cout << '\n';
-                    cyc_str += "| ";
-                }
-                log_.error("cycles: " + cyc_str);
-                set_status("Обнаружены циклы — CMake невозможен", true);
+                std::cout << "Предупреждение: обнаружены циклы включения заголовков; "
+                             "генерация будет продолжена.\n";
+                log_.write("[cmake] header/module include cycles detected");
+            }
+
+            if (builder_.validate_configuration() != 0) {
+                set_status("Некорректные параметры CMake", true);
+                return;
+            }
+            cmake_layout_t layout;
+            int lst = layout.build(tree);
+            if (lst == 0x01) {
+                log_.error("cmake_layout: cycles");
+                set_status("Циклы в зависимостях — CMake невозможен", true);
                 wait_enter();
                 return;
             }
-
-            cmake_layout_t layout;
-            if (layout.build(tree) != 0x00) {
+            if (lst == 0x03) {
+                log_.error("cmake_layout: subdir cycle");
+                set_status("Цикл в порядке add_subdirectory", true);
+                wait_enter();
+                return;
+            }
+            if (lst != 0x00) {
                 log_.error("cmake_layout.build failed");
                 set_status("Не удалось построить план", true);
                 return;
@@ -769,22 +792,14 @@ class tui_t {
             std::cout << "\n=== План CMake ===\n";
             layout.print();
 
+            std::cout << "\nГенерация в " << cmake_writer_t::staged_root
+                      << " (существующие исходные CMakeLists.txt не изменяются).\n";
             bool ok = false;
-            if (std::filesystem::exists("CMakeLists.txt")) {
-                if (ask_yesno("\nCMakeLists.txt существует. Перезаписать?", ok)
-                    != input_result::ok || !ok) {
-                    set_status("Отменено");
-                    return;
-                }
-            } else {
-                if (ask_yesno("\nЗаписать CMakeLists.txt на диск?", ok)
-                    != input_result::ok || !ok) {
-                    set_status("Отменено");
-                    return;
-                }
+            if (ask_yesno("Сгенерировать проект CMake?", ok) != input_result::ok || !ok) {
+                set_status("Отменено");
+                return;
             }
-
-            int st = cmake_writer_t::save(tree, layout, builder_.config());
+            int st = cmake_writer_t::save_staged(tree, layout, builder_.config());
             if (st == 0x00) {
                 std::string paths;
                 for (const auto& [p, _] : layout.files()) {
@@ -806,68 +821,66 @@ class tui_t {
         }
 
         void do_build_cmake() {
-            if (!std::filesystem::exists("CMakeLists.txt")) {
-                log_.error("build_cmake: CMakeLists.txt missing");
-                set_status("CMakeLists.txt не найден (п. 18)", true);
+            if (!std::filesystem::exists(
+                std::filesystem::path(cmake_writer_t::staged_root) / "CMakeLists.txt")) {
+                set_status("Сначала сгенерируйте CMake (п. 18)", true);
                 return;
             }
-
             std::string build_dir;
             if (ask_line("Директория сборки (пусто = build_cmake): ",
                          build_dir, true) == input_result::eof) return;
             if (build_dir.empty()) build_dir = "build_cmake";
-
-            std::string generator_opt;
-            std::string check = "where ninja >nul 2>nul";
-#ifdef __linux__
-            check = "command -v ninja >/dev/null 2>&1";
-#endif
-            if (std::system(check.c_str()) == 0) {
+            if (!pgr_paths::safe_build_dir(build_dir)) {
+                set_status("Недопустимый каталог сборки: " + build_dir, true);
+                return;
+            }
+            std::vector<std::string> configure = {
+                "cmake", "-S", cmake_writer_t::staged_root, "-B", build_dir
+            };
+            if (!std::filesystem::exists(std::filesystem::path(build_dir) / "CMakeCache.txt") &&
+                pgr_process::available("ninja")) {
                 bool use_ninja = false;
                 if (ask_yesno("Использовать Ninja?", use_ninja)
                     == input_result::ok && use_ninja) {
-                    generator_opt = " -G Ninja";
+                    configure.push_back("-G");
+                    configure.push_back("Ninja");
                 }
             }
-
-            std::string configure_cmd =
-                "cmake -S . -B " + build_dir + generator_opt
-                + " -DCMAKE_CXX_COMPILER=" + builder_.config().compiler;
-            std::string build_cmd = "cmake --build " + build_dir;
-
-            std::cout << "\nConfigure: " << configure_cmd << '\n';
-            std::cout << "Build:     " << build_cmd << '\n';
-
+            if (builder_.config().toolchain_file.empty()) {
+                configure.push_back("-DCMAKE_CXX_COMPILER=" + builder_.config().compiler);
+                if (builder_.config().compiler == "gcc" || builder_.config().compiler == "clang")
+                    configure.push_back("-DCMAKE_C_COMPILER=" + builder_.config().compiler);
+            }
+            std::vector<std::string> build = {"cmake", "--build", build_dir};
+            std::cout << "\nConfigure: " << pgr_process::display(configure) << '\n';
+            std::cout << "Build: " << pgr_process::display(build) << '\n';
             bool ok = false;
             if (ask_yesno("Выполнить?", ok) != input_result::ok || !ok) {
                 set_status("Отменено");
                 return;
             }
-
-            std::cout << "\n--- cmake configure ---\n";
-            log_.write("[cmake] configure: " + configure_cmd);
-            int rc1 = std::system(configure_cmd.c_str());
+            log_.write("[cmake] configure: " + pgr_process::display(configure));
+            const int rc1 = pgr_process::run(configure, false, [this](const std::string& line) {
+                log_.write("[cmake configure] " + line);
+            });
             log_.write("[cmake] configure rc=" + std::to_string(rc1));
             if (rc1 != 0) {
                 set_status("Configure failed, rc=" + std::to_string(rc1), true);
                 wait_enter();
                 return;
             }
-
-            std::cout << "\n--- cmake build ---\n";
-            log_.write("[cmake] build: " + build_cmd);
-            int rc2 = std::system(build_cmd.c_str());
+            log_.write("[cmake] build: " + pgr_process::display(build));
+            const int rc2 = pgr_process::run(build, false, [this](const std::string& line) {
+                log_.write("[cmake build] " + line);
+            });
             log_.write("[cmake] build rc=" + std::to_string(rc2));
-            if (rc2 != 0) {
-                set_status("Build failed, rc=" + std::to_string(rc2), true);
-            } else {
-                set_status("Сборка CMake: успех (" + build_dir + ")");
-            }
+            set_status(rc2 == 0 ? "Сборка CMake: успех" :
+                       "Build failed, rc=" + std::to_string(rc2), rc2 != 0);
             wait_enter();
         }
 
         // ------------------------------------------------------------------
-        // Действия: конфиг
+        // Действия: конфиг (20-21)
         // ------------------------------------------------------------------
 
         void do_save_config() {
@@ -892,6 +905,149 @@ class tui_t {
             } else {
                 log_.error("load_config rc=" + std::to_string(st));
                 set_status("Ошибка загрузки, rc=" + std::to_string(st), true);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Действия: пакеты, профили, сервис (22-25)
+        // ------------------------------------------------------------------
+
+        void do_packages() {
+            auto cur = builder_.config().packages;
+            edit_string_list("Пакеты (find_package)",
+                             cur,
+                             "Имя (fmt) или name|target::name: ",
+                             false, false);
+            builder_.set_packages(cur);
+            log_.write("[set] packages=" + disp_list(cur));
+            set_status("Пакеты: " + disp_list(cur));
+        }
+
+        void do_profile() {
+            namespace fs = std::filesystem;
+
+            std::vector<std::string> profiles;
+            if (fs::is_directory(kProfilesDir)) {
+                for (const auto& e : fs::directory_iterator(kProfilesDir)) {
+                    if (e.is_regular_file() && e.path().extension() == ".cfg") {
+                        profiles.push_back(e.path().stem().string());
+                    }
+                }
+            }
+            std::sort(profiles.begin(), profiles.end());
+
+            if (profiles.empty()) {
+                std::cout << "\nПрофилей нет. Создайте файлы в "
+                          << kProfilesDir << "/NAME.cfg\n";
+                set_status("Нет профилей в " + std::string(kProfilesDir), true);
+                wait_enter();
+                return;
+            }
+
+            std::cout << "\nПрофили (0 = custom, без профиля):\n";
+            std::cout << " 0. (custom / config.cfg)\n";
+            for (std::size_t i = 0; i < profiles.size(); ++i) {
+                std::cout << " " << (i + 1) << ". " << profiles[i];
+                if (profiles[i] == builder_.config().profile)
+                    std::cout << "  <- текущий";
+                std::cout << '\n';
+            }
+
+            int choice = -1;
+            if (ask_int("Выбор: ", 0, static_cast<int>(profiles.size()), choice)
+                != input_result::ok) return;
+
+            if (choice == 0) {
+                if (builder_.load(kConfigPath) != 0) {
+                    set_status("Не удалось загрузить custom-конфигурацию", true);
+                    return;
+                }
+                builder_.set_profile("");
+                log_.write("[profile] restored custom config");
+                set_status("Профиль: custom");
+                return;
+            }
+
+            const std::string name = profiles[choice - 1];
+            const std::string path = std::string(kProfilesDir) + "/" + name + ".cfg";
+            int st = builder_.load(path);
+            if (st == 0x00) {
+                builder_.set_profile(name);
+                log_.write("[profile] loaded " + name);
+                set_status("Профиль: " + name);
+            } else {
+                log_.error("profile load failed: " + name);
+                set_status("Ошибка загрузки профиля " + name, true);
+            }
+        }
+
+        void do_clean_cmake() {
+            namespace fs = std::filesystem;
+            if (!fs::exists("build_cmake")) {
+                set_status("build_cmake не существует", true);
+                return;
+            }
+            bool ok = false;
+            if (ask_yesno("Удалить build_cmake полностью?", ok)
+                != input_result::ok || !ok) {
+                set_status("Отменено");
+                return;
+            }
+            std::string error;
+            if (!pgr_paths::clean("build_cmake", error)) {
+                log_.error("clean_cmake: " + error);
+                set_status("Ошибка удаления: " + error, true);
+            } else {
+                log_.write("[cmake] clean build_cmake");
+                set_status("build_cmake удалён");
+            }
+        }
+
+        void do_copy_compile_commands() {
+            namespace fs = std::filesystem;
+            const fs::path src = "build_cmake/compile_commands.json";
+            const fs::path dst = "compile_commands.json";
+
+            if (!fs::exists(src)) {
+                log_.error("compile_commands.json not found");
+                set_status("Нет " + src.string() + " (сначала п.19)", true);
+                return;
+            }
+            std::error_code ec;
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                log_.error("copy cc.json: " + ec.message());
+                set_status("Ошибка: " + ec.message(), true);
+            } else {
+                log_.write("[cmake] copied compile_commands.json");
+                set_status("compile_commands.json скопирован");
+            }
+        }
+
+        void do_advanced(int item) {
+            const auto& cfg = builder_.config();
+            std::string previous = item == 26 ? cfg.toolchain_file :
+                item == 27 ? cfg.c_standard : item == 28 ? cfg.linker_script : cfg.target_type;
+            std::string value;
+            const std::string prompt = item == 26 ? "Путь к toolchain.cmake: " :
+                item == 27 ? "Стандарт C (-std=c11): " :
+                item == 28 ? "Путь к linker.ld: " : "Библиотеки (static/shared): ";
+            if (ask_line(prompt, value, true) != input_result::ok) return;
+            auto assign = [&](const std::string& v) {
+                switch (item) {
+                    case 26: builder_.set_toolchain_file(v); break;
+                    case 27: builder_.set_c_standard(v); break;
+                    case 28: builder_.set_linker_script(v); break;
+                    case 29: builder_.set_target_type(v); break;
+                }
+            };
+            assign(value);
+            if (builder_.validate_configuration() != 0) {
+                assign(previous);
+                set_status("Некорректное значение параметра", true);
+            } else {
+                log_.write("[config] advanced setting " + std::to_string(item) + ": " + value);
+                set_status("Параметр обновлён");
             }
         }
 
@@ -922,6 +1078,10 @@ class tui_t {
                 case 19: return "build_cmake";
                 case 20: return "save_config";
                 case 21: return "load_config";
+                case 22: return "packages";
+                case 23: return "profile";
+                case 24: return "clean_cmake";
+                case 25: return "copy_compile_commands";
                 case 0:  return "exit";
                 default: return "unknown";
             }
@@ -932,28 +1092,33 @@ class tui_t {
                        " (" + choice_name(choice) + ")");
 
             switch (choice) {
-                case 1:  do_compiler();       break;
-                case 2:  do_standard();       break;
-                case 3:  do_optimization();   break;
-                case 4:  do_debug();          break;
-                case 5:  do_warnings();       break;
-                case 6:  do_sanitizers();     break;
-                case 7:  do_lto();            break;
-                case 8:  do_arch();           break;
-                case 9:  do_specific_gcc();   break;
-                case 10: do_specific_clang(); break;
-                case 11: do_source_files();   break;
-                case 12: do_output_file();    break;
-                case 13: do_include_dirs();   break;
-                case 14: do_library_dirs();   break;
-                case 15: do_libraries();      break;
-                case 16: do_show_command();   break;
-                case 17: do_build();          break;
-                case 18: do_generate_cmake(); break;
-                case 19: do_build_cmake();    break;
-                case 20: do_save_config();    break;
-                case 21: do_load_config();    break;
-                case 0:  running_ = false;    break;
+                case 1:  do_compiler();              break;
+                case 2:  do_standard();              break;
+                case 3:  do_optimization();          break;
+                case 4:  do_debug();                 break;
+                case 5:  do_warnings();              break;
+                case 6:  do_sanitizers();            break;
+                case 7:  do_lto();                   break;
+                case 8:  do_arch();                  break;
+                case 9:  do_specific_gcc();          break;
+                case 10: do_specific_clang();        break;
+                case 11: do_source_files();          break;
+                case 12: do_output_file();           break;
+                case 13: do_include_dirs();          break;
+                case 14: do_library_dirs();          break;
+                case 15: do_libraries();             break;
+                case 16: do_show_command();          break;
+                case 17: do_build();                 break;
+                case 18: do_generate_cmake();        break;
+                case 19: do_build_cmake();           break;
+                case 20: do_save_config();           break;
+                case 21: do_load_config();           break;
+                case 22: do_packages();              break;
+                case 23: do_profile();               break;
+                case 24: do_clean_cmake();           break;
+                case 25: do_copy_compile_commands(); break;
+                case 26: case 27: case 28: case 29: do_advanced(choice); break;
+                case 0:  running_ = false;           break;
                 default: set_status("Нет такого пункта", true); break;
             }
         }
@@ -1003,22 +1168,24 @@ class tui_t {
                 print_menu();
 
                 int choice = -1;
-                auto r = ask_int("Выбор: ", 0, 21, choice);
+                auto r = ask_int("Выбор: ", 0, 29, choice);
                 if (r == input_result::eof) {
                     log_.write("[menu] EOF");
                     break;
                 }
                 if (r == input_result::cancelled) continue;
 
+                const auto before = builder_.config();
                 handle(choice);
-                builder_.save(kConfigPath);
+                if (builder_.config().profile.empty() && builder_.config() != before)
+                    builder_.save(kConfigPath);
             }
 
-            builder_.save(kConfigPath);
             log_.write("=== Session ended ===");
 
             clear_screen();
             std::cout << "Настройки: " << kConfigPath << '\n'
+                      << "Профили:   " << kProfilesDir << "/*.cfg\n"
                       << "Лог:       " << kLogPath << '\n'
                       << "До встречи!\n";
         }

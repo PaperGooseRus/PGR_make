@@ -1,2 +1,2 @@
 -flto|Link-Time Optimization (межмодульная оптимизация)
--flto=thin|ThinLTO (быстрее, чем полный LTO, поддерживается GCC и Clang)
+-flto=thin|ThinLTO (быстрее, чем полный LTO, только Clang/LLVM, не GCC)

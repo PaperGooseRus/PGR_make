@@ -164,16 +164,9 @@ class cmake_layout_t {
             target_home_.clear();
             target_info_.clear();
 
-            const auto cyc = tree.cycles();
-            if (!cyc.empty()) {
-                std::cerr << "cmake_layout_t: cycles detected, cannot build\n";
-                for (const auto& c : cyc) {
-                    std::cerr << "  ";
-                    for (const auto& m : c) std::cerr << m << " ";
-                    std::cerr << "\n";
-                }
-                return 0x01;
-            }
+            // Include cycles do not imply cycles between link targets.
+            // CMake can resolve cyclic static-library dependencies; let it diagnose
+            // an actual target-level or linker problem instead of rejecting headers.
 
             const auto targets = tree.guess_targets();
             if (targets.empty()) {

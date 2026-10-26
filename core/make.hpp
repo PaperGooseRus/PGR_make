@@ -2,14 +2,18 @@
 #define MAKE_HPP
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
+#include "process_runner.hpp"
 #include "read.hpp"
 #include "write.hpp"
 
@@ -158,6 +162,18 @@ class make_t {
             std::vector<std::string> include_dirs;   ///< -I<dir>
             std::vector<std::string> library_dirs;   ///< -L<dir>
             std::vector<std::string> libraries;      ///< -l<name> или готовый флаг
+
+            std::vector<std::string> packages; ///< "name" или "name|target::name"
+            std::string profile;               ///< "debug" / "release" / "" (custom)
+            std::string toolchain_file;        ///< CMake toolchain for cross-compilation
+            std::string c_standard;            ///< e.g. c11 / -std=c11
+            std::string linker_script;         ///< embedded linker script (.ld)
+            std::string target_type;           ///< static or shared for library targets
+            bool operator==(const config_t& o) const {
+                return std::tie(compiler, source_files, output_file, standard, optimization, debug, lto, arch, warnings, sanitizers, specific_gcc, specific_clang, include_dirs, library_dirs, libraries, packages, profile, toolchain_file, c_standard, linker_script, target_type) ==
+                    std::tie(o.compiler, o.source_files, o.output_file, o.standard, o.optimization, o.debug, o.lto, o.arch, o.warnings, o.sanitizers, o.specific_gcc, o.specific_clang, o.include_dirs, o.library_dirs, o.libraries, o.packages, o.profile, o.toolchain_file, o.c_standard, o.linker_script, o.target_type);
+            }
+            bool operator!=(const config_t& o) const { return !(*this == o); }
         };
 
     private:
@@ -166,9 +182,16 @@ class make_t {
         std::string command_;
 
         /// @brief Кавычить строку, если в ней есть пробелы или табы.
-        static std::string quote_if_needed(const std::string& s) {
-            if (s.find_first_of(" \t") == std::string::npos) return s;
-            return "\"" + s + "\"";
+        static std::string quote_if_needed(const std::string& s) { return s; }
+        static bool safe_flag(const std::string& flag) {
+            if (flag.empty() || flag[0] != '-') return false;
+            for (unsigned char ch : flag) {
+                if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '=' ||
+                    ch == '+' || ch == '.' || ch == '/' || ch == ':' ||
+                    ch == ',' || ch == '@' || ch == '%') continue;
+                return false;
+            }
+            return true;
         }
 
     public:
@@ -183,6 +206,44 @@ class make_t {
          */
         static bool has_shell_meta(const std::string& s) {
             return s.find_first_of(";|&`$<>\"\n\r") != std::string::npos;
+        }
+
+        int validate_configuration(bool require_sources = false) const {
+            if (cfg_.compiler.empty() || cfg_.compiler.find_first_of("\r\n") != std::string::npos)
+                return 0x06;
+            if (require_sources && cfg_.source_files.empty()) return 0x06;
+            auto has_san = [this](const std::string& s) {
+                return std::find(cfg_.sanitizers.begin(), cfg_.sanitizers.end(), s)
+                       != cfg_.sanitizers.end();
+            };
+            if ((has_san("-fsanitize=address") && has_san("-fsanitize=thread")) ||
+                (has_san("-fsanitize=address") && has_san("-fsanitize=memory")) ||
+                (has_san("-fsanitize=thread") && has_san("-fsanitize=leak"))) return 0x06;
+            if (cfg_.lto == "-flto=thin" && cfg_.compiler.find("clang") == std::string::npos &&
+                cfg_.toolchain_file.empty()) return 0x06;
+            if (!cfg_.target_type.empty() && cfg_.target_type != "static" && cfg_.target_type != "shared")
+                return 0x06;
+            for (const auto& flag : {cfg_.standard, cfg_.optimization, cfg_.debug,
+                                     cfg_.lto, cfg_.arch, cfg_.c_standard})
+                if (!flag.empty() && !safe_flag(flag)) return 0x06;
+            for (const auto& vec : {cfg_.warnings, cfg_.sanitizers,
+                                    cfg_.specific_gcc, cfg_.specific_clang})
+                for (const auto& flag : vec) if (!safe_flag(flag)) return 0x06;
+            for (const auto& vec : {cfg_.source_files, cfg_.include_dirs,
+                                    cfg_.library_dirs, cfg_.libraries})
+                for (const auto& v : vec)
+                    if (v.find_first_of("\r\n") != std::string::npos) return 0x06;
+            for (const auto& pkg : cfg_.packages) {
+                if (pkg.empty()) return 0x06;
+                for (unsigned char c : pkg)
+                    if (!std::isalnum(c) && c != '_' && c != '-' && c != '+' &&
+                        c != '.' && c != ':' && c != '|' && c != '/') return 0x06;
+            }
+            if (cfg_.toolchain_file.find_first_of("\r\n") != std::string::npos ||
+                cfg_.linker_script.find_first_of("\r\n") != std::string::npos ||
+                cfg_.output_file.find_first_of("\r\n") != std::string::npos)
+                return 0x06;
+            return 0;
         }
 
         /// @name Сеттеры конфигурации
@@ -203,6 +264,13 @@ class make_t {
         void set_include_dirs(const std::vector<std::string>& v)   { cfg_.include_dirs   = v; }
         void set_library_dirs(const std::vector<std::string>& v)   { cfg_.library_dirs   = v; }
         void set_libraries(const std::vector<std::string>& v)      { cfg_.libraries      = v; }
+    
+        void set_packages(const std::vector<std::string>& v) { cfg_.packages = v; }
+        void set_profile(const std::string& v)               { cfg_.profile  = v; }
+        void set_toolchain_file(const std::string& v)        { cfg_.toolchain_file = v; }
+        void set_c_standard(const std::string& v)            { cfg_.c_standard = v; }
+        void set_linker_script(const std::string& v)         { cfg_.linker_script = v; }
+        void set_target_type(const std::string& v)           { cfg_.target_type = v; }
         /// @}
 
         /// @brief Доступ к текущей конфигурации.
@@ -228,6 +296,10 @@ class make_t {
             args_.clear();
 
             // 1. Критические проверки.
+            if (validate_configuration(true) != 0) {
+                std::cerr << "make_t: invalid configuration\n";
+                return 0x06;
+            }
             if (cfg_.compiler.empty()) {
                 std::cerr << "make_t: compiler is empty\n";
                 return 0x06;
@@ -254,6 +326,20 @@ class make_t {
                 }
             }
 
+            // Validate ALL compiler switches, including imported configs.
+            std::vector<std::string> flags;
+            for (const auto& f : {cfg_.standard, cfg_.optimization, cfg_.debug,
+                                  cfg_.lto, cfg_.arch, cfg_.c_standard})
+                if (!f.empty()) flags.push_back(f);
+            for (const auto& group : {cfg_.warnings, cfg_.sanitizers,
+                                     cfg_.specific_gcc, cfg_.specific_clang})
+                flags.insert(flags.end(), group.begin(), group.end());
+            for (const auto& flag : flags) {
+                if (!safe_flag(flag)) {
+                    std::cerr << "make_t: invalid compiler option: " << flag << '\n';
+                    return 0x06;
+                }
+            }
             // 2. Проверка несовместимых санитайзеров.
             auto has_san = [this](const std::string& s) {
                 return std::find(cfg_.sanitizers.begin(),
@@ -283,7 +369,12 @@ class make_t {
                 if (!s.empty()) args_.push_back(s);
             };
 
-            add(cfg_.standard);
+            const bool c_only = std::all_of(cfg_.source_files.begin(),
+                cfg_.source_files.end(), [](const std::string& p) {
+                    return std::filesystem::path(p).extension() == ".c";
+                });
+            if (c_only) add(cfg_.c_standard);
+            else add(cfg_.standard);
             add(cfg_.optimization);
             add(cfg_.debug);
 
@@ -349,6 +440,11 @@ class make_t {
                 else               args_.push_back("-l" + lib);
             }
 
+            if (!cfg_.linker_script.empty()) {
+                args_.push_back("-T");
+                args_.push_back(cfg_.linker_script);
+            }
+
             // 8. Вывод.
             if (!cfg_.output_file.empty()) {
                 args_.push_back("-o");
@@ -367,18 +463,7 @@ class make_t {
          * @return @c 0x00 при успехе.
          */
         int build_command(const std::vector<std::string>& v) {
-            command_.clear();
-            const std::string sep = " ";
-
-            std::size_t total = 0;
-            for (const auto& s : v) total += s.size();
-            if (!v.empty()) total += sep.size() * (v.size() - 1);
-            command_.reserve(total);
-
-            for (std::size_t i = 0; i < v.size(); ++i) {
-                if (i > 0) command_ += sep;
-                command_ += v[i];
-            }
+            command_ = pgr_process::display(v);
             return 0x00;
         }
 
@@ -396,19 +481,15 @@ class make_t {
          * @return @c 0x00 при успехе, @c 0x01 если @ref command_ пуста,
          *         @c 0x02 если команда завершилась с ошибкой.
          */
-        int run() {
-            if (command_.empty()) {
-                std::cerr << "make_t: command is empty\n";
+        int run(const std::function<void(const std::string&)>& on_output = {}) {
+            if (args_.empty()) {
+                std::cerr << "make_t: no command arguments (call build_args)\n";
                 return 0x01;
             }
-
-            std::cout << "Executing: " << command_ << '\n';
-
-            int rc = std::system(command_.c_str());
+            std::cout << "Executing: " << pgr_process::display(args_) << '\n' << std::flush;
+            const int rc = pgr_process::run(args_, false, on_output);
             if (rc != 0) {
-                std::cerr << "make_t: command failed, rc = " << rc << '\n'
-                          << "  Check compiler in PATH, source files exist, "
-                             "and only one main().\n";
+                std::cerr << "make_t: compiler failed, rc=" << rc << '\n';
                 return 0x02;
             }
             return 0x00;
@@ -460,6 +541,12 @@ class make_t {
                 lines.push_back("lto="          + cfg_.lto);
             if (!cfg_.arch.empty())
                 lines.push_back("arch="         + cfg_.arch);
+            if (!cfg_.profile.empty())
+                lines.push_back("profile=" + cfg_.profile);
+            if (!cfg_.toolchain_file.empty()) lines.push_back("toolchain_file=" + cfg_.toolchain_file);
+            if (!cfg_.c_standard.empty()) lines.push_back("c_standard=" + cfg_.c_standard);
+            if (!cfg_.linker_script.empty()) lines.push_back("linker_script=" + cfg_.linker_script);
+            if (!cfg_.target_type.empty()) lines.push_back("target_type=" + cfg_.target_type);
 
             for (const auto& w : cfg_.warnings)
                 lines.push_back("warnings="       + w);
@@ -475,6 +562,8 @@ class make_t {
                 lines.push_back("library_dirs="   + s);
             for (const auto& s : cfg_.libraries)
                 lines.push_back("libraries="      + s);
+            for (const auto& p : cfg_.packages)
+                lines.push_back("packages=" + p);
 
             write_t w(path);
             if (w.status() != 0x00) return 0x03;
@@ -500,6 +589,7 @@ class make_t {
             config_t fresh;
 
             std::string line;
+            bool recognized = false;
             while (std::getline(in, line)) {
                 if (!line.empty() && line.back() == '\r') line.pop_back();
                 if (line.empty() || line[0] == '#') continue;
@@ -509,6 +599,14 @@ class make_t {
 
                 const std::string key = line.substr(0, eq);
                 const std::string val = line.substr(eq + 1);
+                if (key == "compiler" || key == "source_files" || key == "standard" ||
+                    key == "output_file" || key == "optimization" || key == "debug" ||
+                    key == "warnings" || key == "sanitizers" || key == "lto" ||
+                    key == "arch" || key == "specific_gcc" || key == "specific_clang" ||
+                    key == "include_dirs" || key == "library_dirs" || key == "libraries" ||
+                    key == "profile" || key == "packages" || key == "toolchain_file" ||
+                    key == "c_standard" || key == "linker_script" ||
+                    key == "target_type") recognized = true;
 
                 if      (key == "compiler")       fresh.compiler      = val;
                 else if (key == "source_files")   fresh.source_files.push_back(val);
@@ -525,9 +623,19 @@ class make_t {
                 else if (key == "include_dirs")   fresh.include_dirs.push_back(val);
                 else if (key == "library_dirs")   fresh.library_dirs.push_back(val);
                 else if (key == "libraries")      fresh.libraries.push_back(val);
+                else if (key == "profile")  fresh.profile = val;
+                else if (key == "packages") fresh.packages.push_back(val);
+                else if (key == "toolchain_file") fresh.toolchain_file = val;
+                else if (key == "c_standard") fresh.c_standard = val;
+                else if (key == "linker_script") fresh.linker_script = val;
+                else if (key == "target_type") fresh.target_type = val;
             }
 
             if (in.bad()) return 0x05;
+            if (!recognized || fresh.compiler.empty()) return 0x06;
+            make_t checked;
+            checked.cfg_ = fresh;
+            if (checked.validate_configuration() != 0) return 0x06;
 
             cfg_ = std::move(fresh);
             return 0x00;
