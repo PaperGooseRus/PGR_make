@@ -18,7 +18,8 @@ int main() { try {
     put(project/".pgr_build/sample/output.exe","generated data");
     check(!pgr_paths::clean(".pgr_build/sample",project,t.path/"foreign",error),"foreign ownership accepted");
     check(fs::exists(project/".pgr_build/sample/output.exe"),"foreign cleanup deleted files");
-    check(pgr_paths::clean(".pgr_build/sample",project,store,error),"owned cleanup: "+error);
+    const bool cleaned=pgr_paths::clean(".pgr_build/sample",project,store,error);
+    check(cleaned,"owned cleanup: "+error);
     check(!fs::exists(project/".pgr_build/sample"),"owned build remained");
     fs::create_directories(t.path/"external");
     std::error_code ec;

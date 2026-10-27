@@ -82,6 +82,10 @@ inline std::vector<history_entry> load_history(const fs::path& file, std::size_t
         history_entry value;
         if (!std::getline(ss,value.timestamp,'\t') || !std::getline(ss,value.result,'\t') ||
             !std::getline(ss,value.elapsed,'\t') || !std::getline(ss,value.mode,'\t')) continue;
+        // Tolerate LF and CRLF history written by older releases or editors.
+        for (auto* field : {&value.timestamp, &value.result, &value.elapsed, &value.mode}) {
+            if (!field->empty() && field->back() == '\r') field->pop_back();
+        }
         try { (void)std::stoll(value.timestamp); (void)std::stoll(value.elapsed); }
         catch (...) { continue; }
         result.push_back(std::move(value));

@@ -112,6 +112,9 @@ inline bool clean(const fs::path& target, const fs::path& source_root,
     std::ifstream f(marker_path(dest), std::ios::binary);
     if (!f) { error = "refusing cleanup without PGR ownership marker"; return false; }
     std::string actual((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    // Windows refuses to delete an open marker.  Close before remove_all(),
+    // including when a previous foreign-owner check failed.
+    f.close();
     if (actual != owner_id(source_root, project_store)) {
         error = "refusing cleanup: build belongs to another project"; return false;
     }

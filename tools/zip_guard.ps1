@@ -1,6 +1,7 @@
 param([Parameter(Mandatory=$true)][string]$Archive,[Parameter(Mandatory=$true)][string]$Target)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
 $root = [System.IO.Path]::GetFullPath($Target)
 $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
 try {

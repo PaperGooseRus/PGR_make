@@ -307,16 +307,28 @@ public:
         const fs::path extracted=staging/"unpacked";
         fs::create_directories(extracted,ec);
         if(ec){error=ec.message();return false;}
+        // Capture extractor diagnostics so a real Windows failure is actionable.
+        std::string extractor_log;
+        pgr_process::options extractor_options;
+        extractor_options.quiet=true;
+        extractor_options.output=[&](const std::string& line) {
+            extractor_log += line + "\n";
+            if (extractor_log.size()>2048) extractor_log.erase(0,extractor_log.size()-2048);
+        };
 #ifdef _WIN32
         const auto script=script_root_/"tools"/"zip_guard.ps1";
-        const int extract_rc=pgr_process::run({"powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass",
-                                              "-File",pgr_workspace::utf8(script),pgr_workspace::utf8(archive),pgr_workspace::utf8(extracted)},true);
+        const int extract_rc=pgr_process::run_ex({"powershell.exe","-NoProfile","-NonInteractive","-ExecutionPolicy","Bypass",
+                                              "-File",pgr_workspace::utf8(script),pgr_workspace::utf8(archive),pgr_workspace::utf8(extracted)},extractor_options);
 #else
         const auto script=script_root_/"tools"/"zip_guard.py";
-        const int extract_rc=pgr_process::run({"python3",pgr_workspace::utf8(script),
-                                              pgr_workspace::utf8(archive),pgr_workspace::utf8(extracted)},true);
+        const int extract_rc=pgr_process::run_ex({"python3",pgr_workspace::utf8(script),
+                                              pgr_workspace::utf8(archive),pgr_workspace::utf8(extracted)},extractor_options);
 #endif
-        if(extract_rc!=0 || contains_link(extracted)) {error="unsafe ZIP or extraction failed";return false;}
+        if(extract_rc!=0 || contains_link(extracted)) {
+            error="unsafe ZIP or extraction failed";
+            if(extract_rc!=0 && !extractor_log.empty()) error += ": " + extractor_log;
+            return false;
+        }
         // Accept archives with a single containing directory (e.g., Kitware CMake).
         fs::path content=extracted;
         if(!fs::exists(content/fs::u8path(pkg.executable))) {

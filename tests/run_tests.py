@@ -59,6 +59,25 @@ def main():
         "gcc_specific": ({"main.cpp": "int main(){return 0;}\n"},
                          "compiler=g++\nsource_files=main.cpp\nspecific_gcc=-Wall\n"),
     }
+    # MinGW UCRT64 GCC may accept -fsanitize=address but ship no libasan.
+    # A successful compile *and link* probe is required before exercising ASan.
+    compiler = shutil.which("g++")
+    asan_supported = False
+    if compiler:
+        with tempfile.TemporaryDirectory(prefix="pgr_asan_probe_") as probe:
+            source_probe = Path(probe) / "probe.cpp"
+            executable_probe = Path(probe) / ("probe.exe" if os.name == "nt" else "probe")
+            source_probe.write_text("int main(){return 0;}\n", encoding="utf-8")
+            try:
+                check_probe = subprocess.run(
+                    [compiler, "-fsanitize=address", str(source_probe), "-o", str(executable_probe)],
+                    capture_output=True, timeout=30)
+                asan_supported = check_probe.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+    if not asan_supported:
+        del cases["asan"]
+        print("SKIP: AddressSanitizer link runtime unavailable in this toolchain")
     with tempfile.TemporaryDirectory(prefix="pgr_workspaces_") as tmp:
         root = Path(tmp)
         home = root / "PGR Install"
