@@ -4,6 +4,7 @@
  * Layout: GtkPaned, editor / commands at left, project list at right.
  */
 #include <gtk/gtk.h>
+#include "theme.hpp"
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -37,7 +38,12 @@ struct Choice {
     std::vector<std::string> values; // Does not include the final custom entry
 };
 struct Gui {
-    explicit Gui(fs::path root) : registry(std::move(root)) { catalog.load_builtin(); }
+    explicit Gui(fs::path root) : registry(std::move(root)) {
+        catalog.load_builtin();
+        std::ifstream stored_theme(registry.projects_root() / ".pgr_gui_theme");
+        std::string value;
+        if (stored_theme && std::getline(stored_theme, value)) dark_theme = value != "light";
+    }
     registry_t registry;
     flag_catalog_t catalog;
     std::vector<std::string> installed_tool_ids(const std::string& type) {
@@ -55,6 +61,11 @@ struct Gui {
     bool loading = false;
     bool dirty = false;
     bool busy = false;
+    bool dark_theme = true;
+    GtkCssProvider* theme_provider = nullptr;
+    GtkWidget* theme_button = nullptr;
+    GtkWidget* active_project_label = nullptr;
+    GtkWidget* status_spinner = nullptr;
     std::thread worker;
     pgr_process::cancel_token cancellation;
     std::vector<bool> project_available;
@@ -78,6 +89,30 @@ struct Gui {
     std::vector<GtkWidget*> quick_actions;
 };
 static std::string path_utf8(const fs::path& p) { return pgr_workspace::utf8(p); }
+static void set_saved_state(Gui* ui, bool dirty) {
+    if (!ui->dirty_indicator) return;
+    gtk_label_set_text(GTK_LABEL(ui->dirty_indicator), dirty ? "● Изменено" : "✓ Сохранено");
+    if (dirty) gtk_widget_add_css_class(ui->dirty_indicator, "pgr-unsaved");
+    else gtk_widget_remove_css_class(ui->dirty_indicator, "pgr-unsaved");
+}
+static void apply_theme(Gui* ui) {
+    if (!ui->theme_provider) return;
+    const std::string css = pgr_gui_theme::stylesheet(ui->dark_theme);
+    // GTK 4.10 compatibility: load_from_string() was introduced in GTK 4.12.
+    gtk_css_provider_load_from_data(ui->theme_provider, css.c_str(), -1);
+    if (GtkSettings* settings = gtk_settings_get_default())
+        g_object_set(settings, "gtk-application-prefer-dark-theme", ui->dark_theme ? TRUE : FALSE, nullptr);
+    if (ui->theme_button)
+        gtk_button_set_label(GTK_BUTTON(ui->theme_button), ui->dark_theme ? "☀ Светлая" : "◐ Тёмная");
+}
+static void toggle_theme(GtkButton*, gpointer data) {
+    auto* ui = static_cast<Gui*>(data);
+    ui->dark_theme = !ui->dark_theme;
+    apply_theme(ui);
+    // Persist appearance independently of all per-project compiler settings.
+    std::ofstream stored_theme(ui->registry.projects_root() / ".pgr_gui_theme", std::ios::trunc);
+    if (stored_theme) stored_theme << (ui->dark_theme ? "dark\n" : "light\n");
+}
 static void set_status(Gui* ui, const std::string& value) {
     gtk_label_set_text(GTK_LABEL(ui->status), value.c_str());
 }
@@ -114,6 +149,11 @@ static void set_busy(Gui* ui, bool busy) {
     for (auto* button : ui->quick_actions)
         gtk_widget_set_sensitive(button, !busy && !ui->selected.name.empty());
     gtk_widget_set_sensitive(ui->stop_button, busy);
+    if (ui->status_spinner) {
+        gtk_widget_set_visible(ui->status_spinner, busy);
+        if (busy) gtk_spinner_start(GTK_SPINNER(ui->status_spinner));
+        else gtk_spinner_stop(GTK_SPINNER(ui->status_spinner));
+    }
     ui->busy = busy;
 }
 static GtkWidget* action(Gui* ui, GtkWidget* container,
@@ -126,7 +166,7 @@ static void refresh_projects(Gui* ui, const std::string& preferred = {});
 static void mark_dirty(Gui* ui) {
     if (ui->loading || ui->selected.name.empty()) return;
     ui->dirty = true;
-    if (ui->dirty_indicator) gtk_label_set_text(GTK_LABEL(ui->dirty_indicator), "● Не сохранено");
+    set_saved_state(ui, true);
 }
 static void changed_text(GtkEditable*, gpointer data) { mark_dirty(static_cast<Gui*>(data)); }
 static void changed_buffer(GtkTextBuffer*, gpointer data) { mark_dirty(static_cast<Gui*>(data)); }
@@ -251,6 +291,7 @@ static void add_multi(Gui* ui, GtkWidget* parent, const char* key,
     GtkWidget* custom = gtk_text_view_new();
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(custom), GTK_WRAP_NONE);
     gtk_widget_set_size_request(custom, -1, 58);
+    gtk_widget_add_css_class(custom, "pgr-input");
     gtk_box_append(GTK_BOX(wrap), custom);
     ui->lists[std::string("extra_") + key] = custom;
     gtk_expander_set_child(GTK_EXPANDER(exp), wrap);
@@ -376,6 +417,7 @@ static void list_field(Gui* ui, GtkWidget* parent, const char* key, const char* 
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(view), GTK_WRAP_NONE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(view), TRUE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), view);
+    gtk_widget_add_css_class(scroller, "pgr-input-area");
     ui->lists[key] = view;
     gtk_box_append(GTK_BOX(wrap), scroller);
     if (browse_kind) {
@@ -389,6 +431,9 @@ static void list_field(Gui* ui, GtkWidget* parent, const char* key, const char* 
 }
 static GtkWidget* section(GtkWidget* parent, const char* title) {
     GtkWidget* exp = gtk_expander_new(title);
+    gtk_widget_add_css_class(exp, "pgr-section");
+    // Keep the first, most-used category immediately accessible.
+    gtk_expander_set_expanded(GTK_EXPANDER(exp), g_str_has_prefix(title, "1–4.") ? TRUE : FALSE);
     GtkWidget* inside = column(9);
     margins(inside, 10);
     gtk_expander_set_child(GTK_EXPANDER(exp), inside);
@@ -508,13 +553,15 @@ static bool save_settings(Gui* ui) {
         set_status(ui, "Не удалось записать config.cfg"); return false;
     }
     ui->dirty = false;
-    if (ui->dirty_indicator) gtk_label_set_text(GTK_LABEL(ui->dirty_indicator), "Сохранено");
+    set_saved_state(ui, false);
     set_status(ui, "Настройки сохранены: " + ui->selected.name);
     return true;
 }
 
 static void load_project(Gui* ui, const project_t& project) {
     ui->selected = project;
+    if (ui->active_project_label)
+        gtk_label_set_text(GTK_LABEL(ui->active_project_label), project.name.c_str());
     ui->loading = true;
     gtk_label_set_text(GTK_LABEL(ui->project_path), path_utf8(project.source_root).c_str());
     make_t build;
@@ -563,7 +610,7 @@ static void load_project(Gui* ui, const project_t& project) {
     load_multi(ui, "specific_clang", c.specific_clang);
     ui->loading = false;
     ui->dirty = false;
-    if (ui->dirty_indicator) gtk_label_set_text(GTK_LABEL(ui->dirty_indicator), "Сохранено");
+    set_saved_state(ui, false);
     show_diagnostics(ui);
     show_history(ui);
     set_status(ui, "Открыт проект: " + project.name);
@@ -644,6 +691,7 @@ static void refresh_projects(Gui* ui, const std::string& preferred) {
                                g_strdup(ui->projects[i].name.c_str()),g_free);
         GtkWidget* name = label((ui->projects[i].name +
             (ui->project_available[i] ? "" : "  [нет исходников]")).c_str());
+        if (!ui->project_available[i]) gtk_widget_add_css_class(name, "pgr-unavailable");
         gtk_widget_set_margin_top(name, 9);
         gtk_widget_set_margin_bottom(name, 9);
         gtk_widget_set_margin_start(name, 10);
@@ -663,6 +711,7 @@ static void refresh_projects(Gui* ui, const std::string& preferred) {
         load_project(ui, ui->projects[static_cast<size_t>(selection)]);
     } else {
         ui->selected = {};
+        if (ui->active_project_label) gtk_label_set_text(GTK_LABEL(ui->active_project_label), "Нет проекта");
         gtk_label_set_text(GTK_LABEL(ui->project_path), "Проект не выбран");
         set_status(ui, "Создайте первый проект справа");
         set_busy(ui, false);
@@ -719,6 +768,8 @@ static void show_diagnostics(Gui* ui) {
         if (d.column > 0) message += ":" + std::to_string(d.column);
         message += "  " + d.message;
         GtkWidget* row_widget = gtk_list_box_row_new();
+        if (d.severity == "error") gtk_widget_add_css_class(row_widget, "pgr-diagnostic-error");
+        else if (d.severity == "warning") gtk_widget_add_css_class(row_widget, "pgr-diagnostic-warning");
         GtkWidget* line = label(message.c_str());
         gtk_label_set_wrap(GTK_LABEL(line), TRUE);
         margins(line, 6);
@@ -1234,6 +1285,7 @@ static void open_pack_manager(Gui* ui) {
     std::string error;
     if(!manager.load(error)){set_status(ui,"Ошибка Pack: "+error);return;}
     GtkWidget* window=gtk_window_new();
+    gtk_widget_add_css_class(window, "pgr-dialog");
     gtk_window_set_title(GTK_WINDOW(window),"Pack Manager · версии и установка инструментов");
     gtk_window_set_transient_for(GTK_WINDOW(window),GTK_WINDOW(ui->window));
     gtk_window_set_modal(GTK_WINDOW(window),TRUE);
@@ -1357,20 +1409,50 @@ static gboolean on_close_request(GtkWindow*,gpointer payload) {
 static void activate(GtkApplication* app, gpointer payload) {
     auto* ui = static_cast<Gui*>(payload);
     ui->window = gtk_application_window_new(app);
-    gtk_window_set_title(GTK_WINDOW(ui->window), "PGR_Make · GTK4");
-    gtk_window_set_default_size(GTK_WINDOW(ui->window), 1340, 850);
+    gtk_window_set_title(GTK_WINDOW(ui->window), "PGR_Make · Build Workspace");
+    gtk_window_set_default_size(GTK_WINDOW(ui->window), 1380, 880);
+    gtk_widget_add_css_class(ui->window, "pgr-window");
+    ui->theme_provider = gtk_css_provider_new();
+    gtk_style_context_add_provider_for_display(
+        gdk_display_get_default(), GTK_STYLE_PROVIDER(ui->theme_provider),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    apply_theme(ui);
     g_signal_connect(ui->window,"close-request",G_CALLBACK(on_close_request),ui);
-    GtkWidget* root = column(6);
-    margins(root, 8);
+
+    GtkWidget* root = column(0);
+    gtk_widget_add_css_class(root, "pgr-app");
     gtk_window_set_child(GTK_WINDOW(ui->window), root);
-    GtkWidget* header = row(10);
-    GtkWidget* title = label("PGR_Make · Конфигуратор и сборка");
-    gtk_widget_add_css_class(title, "title-2");
-    gtk_box_append(GTK_BOX(header), title);
-    ui->dirty_indicator=label("Сохранено");
-    gtk_widget_add_css_class(ui->dirty_indicator,"dim-label");
-    gtk_box_append(GTK_BOX(header),ui->dirty_indicator);
+
+    GtkWidget* header = row(14);
+    gtk_widget_add_css_class(header, "pgr-header");
     gtk_box_append(GTK_BOX(root), header);
+    GtkWidget* brand_icon = label("◆");
+    gtk_widget_add_css_class(brand_icon, "pgr-brand-mark");
+    gtk_box_append(GTK_BOX(header), brand_icon);
+    GtkWidget* brand_text = column(2);
+    GtkWidget* title = label("PGR_Make");
+    gtk_widget_add_css_class(title, "pgr-brand");
+    gtk_box_append(GTK_BOX(brand_text), title);
+    GtkWidget* subtitle = label("Проекты · Инструменты · Сборка");
+    gtk_widget_add_css_class(subtitle, "pgr-subtitle");
+    gtk_box_append(GTK_BOX(brand_text), subtitle);
+    gtk_box_append(GTK_BOX(header), brand_text);
+    GtkWidget* version = label("0.5 · GTK4");
+    gtk_widget_add_css_class(version, "pgr-pill");
+    gtk_box_append(GTK_BOX(header), version);
+    GtkWidget* header_gap = column();
+    gtk_widget_set_hexpand(header_gap, TRUE);
+    gtk_box_append(GTK_BOX(header), header_gap);
+    ui->active_project_label = label("Нет проекта");
+    gtk_widget_add_css_class(ui->active_project_label, "pgr-meta");
+    gtk_box_append(GTK_BOX(header), ui->active_project_label);
+    ui->dirty_indicator = label("✓ Сохранено");
+    gtk_widget_add_css_class(ui->dirty_indicator, "pgr-save-state");
+    gtk_box_append(GTK_BOX(header), ui->dirty_indicator);
+    ui->theme_button = gtk_button_new_with_label("☀ Светлая");
+    gtk_widget_set_tooltip_text(ui->theme_button, "Переключить тёмную и светлую темы");
+    g_signal_connect(ui->theme_button,"clicked",G_CALLBACK(toggle_theme),ui);
+    gtk_box_append(GTK_BOX(header), ui->theme_button);
 
     // Required orientation: LEFT contains all TUI settings/commands;
     // RIGHT contains the selectable project list.
@@ -1378,27 +1460,35 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_widget_set_hexpand(paned, TRUE);
     gtk_widget_set_vexpand(paned, TRUE);
     gtk_paned_set_wide_handle(GTK_PANED(paned), TRUE);
-    gtk_paned_set_position(GTK_PANED(paned), 1010);
+    gtk_paned_set_position(GTK_PANED(paned), 990);
+    gtk_widget_add_css_class(paned, "pgr-workspace");
     gtk_box_append(GTK_BOX(root), paned);
 
-    GtkWidget* left = column(8);
-    gtk_widget_set_size_request(left, 630, -1);
+    GtkWidget* left = column(12);
+    gtk_widget_add_css_class(left, "pgr-main");
+    gtk_widget_set_size_request(left, 620, -1);
+    gtk_widget_set_margin_end(left, 12);
     gtk_paned_set_start_child(GTK_PANED(paned), left);
-    GtkWidget* top_commands = row(6);
-    const char* modes[]={"PGR CMake","Существующий CMake","Прямая сборка",nullptr};
-    ui->build_choice=gtk_drop_down_new_from_strings(modes);
-    gtk_widget_set_tooltip_text(ui->build_choice,"Способ сборки проекта");
-    gtk_box_append(GTK_BOX(top_commands),ui->build_choice);
-    GtkWidget* primary=gtk_button_new_with_label("▶ Собрать");
-    gtk_widget_add_css_class(primary,"suggested-action");
-    g_signal_connect(primary,"clicked",G_CALLBACK(primary_build),ui);
-    gtk_box_append(GTK_BOX(top_commands),primary);
+    // Compact primary toolbar. Every advanced command remains in the TUI actions expander.
+    GtkWidget* top_commands = row(9);
+    gtk_widget_add_css_class(top_commands, "pgr-toolbar");
+    GtkWidget* build_caption = label("Режим:");
+    gtk_widget_add_css_class(build_caption, "pgr-meta");
+    gtk_box_append(GTK_BOX(top_commands), build_caption);
+    const char* modes[] = {"PGR CMake", "Существующий CMake", "Прямая сборка", nullptr};
+    ui->build_choice = gtk_drop_down_new_from_strings(modes);
+    gtk_widget_set_tooltip_text(ui->build_choice, "Способ сборки проекта");
+    gtk_widget_set_hexpand(ui->build_choice, TRUE);
+    gtk_box_append(GTK_BOX(top_commands), ui->build_choice);
+    GtkWidget* primary = gtk_button_new_with_label("▶ Собрать");
+    gtk_widget_add_css_class(primary, "suggested-action");
+    gtk_widget_add_css_class(primary, "pgr-build");
+    g_signal_connect(primary, "clicked", G_CALLBACK(primary_build), ui);
+    gtk_box_append(GTK_BOX(top_commands), primary);
     ui->quick_actions.push_back(primary);
     ui->quick_actions.push_back(action(ui, top_commands, "Сохранить", "save"));
-    ui->quick_actions.push_back(action(ui, top_commands, "Отменить изменения", "discard"));
-    ui->quick_actions.push_back(action(ui, top_commands, "Собрать CMake", "build"));
-    ui->quick_actions.push_back(action(ui, top_commands, "Собрать напрямую", "direct"));
-    ui->stop_button = action(ui, top_commands, "Остановить", "stop");
+    ui->stop_button = action(ui, top_commands, "■ Стоп", "stop");
+    gtk_widget_add_css_class(ui->stop_button, "pgr-stop");
     gtk_box_append(GTK_BOX(left), top_commands);
 
     GtkWidget* controls = gtk_scrolled_window_new();
@@ -1421,14 +1511,17 @@ static void activate(GtkApplication* app, gpointer payload) {
                      G_CALLBACK(on_profile_changed), ui);
 
     ui->results = gtk_notebook_new();
-    gtk_widget_set_size_request(ui->results, -1, 240);
+    gtk_widget_set_size_request(ui->results, -1, 260);
+    gtk_widget_add_css_class(ui->results, "pgr-results");
     ui->log_view = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(ui->log_view), FALSE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(ui->log_view), TRUE);
+    gtk_widget_add_css_class(ui->log_view, "pgr-log");
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(ui->log_view), GTK_WRAP_WORD_CHAR);
     ui->log_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ui->log_view));
     GtkWidget* logs_scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(logs_scroll), ui->log_view);
+    gtk_widget_add_css_class(logs_scroll, "pgr-log-area");
     gtk_notebook_append_page(GTK_NOTEBOOK(ui->results), logs_scroll, gtk_label_new("Журнал"));
     GtkWidget* errors_scroll = gtk_scrolled_window_new();
     GtkWidget* errors = column(6);
@@ -1449,6 +1542,7 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_box_append(GTK_BOX(diagnostic_controls),copy);
     gtk_box_append(GTK_BOX(errors),diagnostic_controls);
     ui->diagnostics_box = gtk_list_box_new();
+    gtk_widget_add_css_class(ui->diagnostics_box, "pgr-diagnostic-list");
     gtk_list_box_set_selection_mode(GTK_LIST_BOX(ui->diagnostics_box),GTK_SELECTION_SINGLE);
     g_signal_connect(ui->diagnostics_box, "row-activated", G_CALLBACK(on_diagnostic_activated), ui);
     gtk_box_append(GTK_BOX(errors), ui->diagnostics_box);
@@ -1462,12 +1556,12 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_notebook_append_page(GTK_NOTEBOOK(ui->results),history_scroller,gtk_label_new("История"));
     gtk_box_append(GTK_BOX(left), ui->results);
 
-    GtkWidget* right = column(8);
-    gtk_widget_set_size_request(right, 220, -1);
-    margins(right, 6);
+    GtkWidget* right = column(10);
+    gtk_widget_add_css_class(right, "pgr-sidebar");
+    gtk_widget_set_size_request(right, 278, -1);
     gtk_paned_set_end_child(GTK_PANED(paned), right);
     GtkWidget* title_projects = label("ПРОЕКТЫ");
-    gtk_widget_add_css_class(title_projects, "heading");
+    gtk_widget_add_css_class(title_projects, "pgr-sidebar-heading");
     gtk_box_append(GTK_BOX(right), title_projects);
     GtkWidget* buttons = row(5);
     GtkWidget* create = action(ui, buttons, "+ Создать", "new");
@@ -1481,6 +1575,7 @@ static void activate(GtkApplication* app, gpointer payload) {
     GtkWidget* projects_scroll = gtk_scrolled_window_new();
     gtk_widget_set_vexpand(projects_scroll, TRUE);
     ui->project_list = gtk_list_box_new();
+    gtk_widget_add_css_class(ui->project_list, "pgr-project-list");
     gtk_list_box_set_filter_func(GTK_LIST_BOX(ui->project_list),filter_project,ui,nullptr);
     g_signal_connect(ui->project_search,"changed",G_CALLBACK(search_projects_changed),ui);
     gtk_list_box_set_selection_mode(GTK_LIST_BOX(ui->project_list), GTK_SELECTION_SINGLE);
@@ -1493,17 +1588,40 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_label_set_wrap(GTK_LABEL(ui->project_path), TRUE);
     gtk_label_set_selectable(GTK_LABEL(ui->project_path), TRUE);
     gtk_box_append(GTK_BOX(right), ui->project_path);
-    action(ui,right,"Переименовать","project-rename");
-    action(ui,right,"Клонировать настройки","project-clone");
-    action(ui,right,"Изменить путь исходников","project-relocate");
-    action(ui,right,"Убрать из списка","project-archive");
-    action(ui,right,"Управление версиями Pack…","pack-check");
-    action(ui,right,"Выход","exit");
-    action(ui,right,"Выход без сохранения","exit-discard");
+    GtkWidget* manage_project = gtk_expander_new("Действия с проектом");
+    gtk_widget_add_css_class(manage_project, "pgr-section");
+    GtkWidget* manage_actions = column(6);
+    margins(manage_actions, 8);
+    action(ui, manage_actions, "Переименовать", "project-rename");
+    action(ui, manage_actions, "Клонировать настройки", "project-clone");
+    action(ui, manage_actions, "Изменить путь исходников", "project-relocate");
+    action(ui, manage_actions, "Убрать из списка", "project-archive");
+    gtk_expander_set_child(GTK_EXPANDER(manage_project), manage_actions);
+    gtk_box_append(GTK_BOX(right), manage_project);
+    action(ui, right, "◈ Управление Pack", "pack-check");
+    GtkWidget* manage_app = gtk_expander_new("Приложение");
+    gtk_widget_add_css_class(manage_app, "pgr-section");
+    GtkWidget* app_actions = column(6);
+    margins(app_actions, 8);
+    action(ui,app_actions,"Выход","exit");
+    action(ui,app_actions,"Выход без сохранения","exit-discard");
+    gtk_expander_set_child(GTK_EXPANDER(manage_app), app_actions);
+    gtk_box_append(GTK_BOX(right), manage_app);
 
+    GtkWidget* footer = row(8);
+    gtk_widget_add_css_class(footer, "pgr-statusbar");
+    GtkWidget* status_indicator = label("●");
+    gtk_widget_add_css_class(status_indicator, "pgr-accent");
+    gtk_box_append(GTK_BOX(footer), status_indicator);
+    ui->status_spinner = gtk_spinner_new();
+    gtk_widget_set_visible(ui->status_spinner, FALSE);
+    gtk_box_append(GTK_BOX(footer), ui->status_spinner);
     ui->status = label("Готово");
-    gtk_widget_add_css_class(ui->status, "dim-label");
-    gtk_box_append(GTK_BOX(root), ui->status);
+    gtk_widget_add_css_class(ui->status, "pgr-meta");
+    gtk_widget_set_hexpand(ui->status, TRUE);
+    gtk_box_append(GTK_BOX(footer), ui->status);
+    gtk_box_append(GTK_BOX(footer), label("PGR · C++17 / GTK4"));
+    gtk_box_append(GTK_BOX(root), footer);
     refresh_projects(ui);
     log_line(ui, "PGR_Make GTK4: слева настройки и команды, справа проекты.");
     gtk_window_present(GTK_WINDOW(ui->window));
@@ -1520,6 +1638,11 @@ int main(int argc, char** argv) {
     const int result = g_application_run(G_APPLICATION(app), 0, nullptr);
     ui.cancellation.cancel();
     if (ui.worker.joinable()) ui.worker.join();
+    if (ui.theme_provider) {
+        if (GdkDisplay* display = gdk_display_get_default())
+            gtk_style_context_remove_provider_for_display(display, GTK_STYLE_PROVIDER(ui.theme_provider));
+        g_object_unref(ui.theme_provider);
+    }
     g_object_unref(app);
     return result;
 }

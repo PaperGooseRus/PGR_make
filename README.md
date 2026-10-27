@@ -202,3 +202,8 @@ python3 tests/run_features.py build-review/PGR_Make
 ## Новое в версии 0.5: Pack Manager
 
 Управление и закрепление версий, проверка SHA-256, импорт ZIP, установка CMake/Ninja и GTK4-окно менеджера инструментов описаны в [PACK_MANAGER.md](PACK_MANAGER.md). Чтобы пользоваться встроенным каталогом и защищённой распаковкой в Windows, устанавливайте вместе с EXE каталог `tools/`, а также `Pack/catalog.json` (скрипты `build_windows.bat`, `install_to_c_pgr.bat` обновлены).
+
+
+### Оформление GTK4
+
+По умолчанию используется **Ash & Orange** (`#1A1A1A` / `#D97757`). Светлая тема переключается в шапке GUI. Подробнее: [GUI_THEME.md](GUI_THEME.md).
