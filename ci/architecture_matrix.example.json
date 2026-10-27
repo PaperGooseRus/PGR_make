@@ -1,0 +1,22 @@
+{
+  "schema": 1,
+  "fixtures": [
+    {
+      "name": "stm32-example",
+      "source": "../your-fixtures/stm32-example",
+      "mode": "native",
+      "config": "../your-fixtures/stm32-example.pgr.cfg",
+      "artifacts": [".pgr_build/stm32-example/firmware.elf"],
+      "timeout_seconds": 240,
+      "expect": "success",
+      "enabled": false
+    },
+    {
+      "name": "riscv-example",
+      "source": "../your-fixtures/riscv-example",
+      "mode": "native",
+      "expect": "success",
+      "enabled": false
+    }
+  ]
+}

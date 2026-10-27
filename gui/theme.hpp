@@ -51,6 +51,20 @@ inline constexpr const char* kLightPalette = R"PGR_CSS(
 
 inline constexpr const char* kComponents = R"PGR_CSS(
 /* Ash & Orange · PGR_Make GTK4 design system. */
+.pgr-project-summary {
+    background-color: @pgr_panel;
+    border-bottom: 1px solid @pgr_border;
+    padding: 12px 22px;
+}
+.pgr-summary-value { font-weight: 700; font-size: 13px; }
+.pgr-validation-label { font-size: 12px; color: @pgr_muted; }
+.pgr-invalid { outline: 2px solid @pgr_error; outline-offset: 1px; }
+.pgr-result-card { padding: 14px; }
+.pgr-result-title { font-size: 18px; font-weight: 700; }
+.pgr-history-list row { border-bottom: 1px solid @pgr_border; padding: 3px 6px; }
+.pgr-diagnostic-group { font-size: 12px; font-weight: 700; color: @pgr_muted; }
+.pgr-diagnostic-note { margin-left: 18px; opacity: 0.85; }
+
 window, dialog, popover {
     background-color: @pgr_bg;
     color: @pgr_text;

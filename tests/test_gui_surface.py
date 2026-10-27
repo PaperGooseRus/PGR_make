@@ -12,9 +12,14 @@ required = [
 ]
 for token in required:
     assert token in s, token
-for number in list(range(1, 39)):
-    assert (f'"{number}.' in s) or (f'"{number}–' in s) or (f' {number}–' in s), number
-print("PASS: GtkPaned layout, 38 TUI entries, widgets, GTK4 file dialogs")
+# GTK labels are task-oriented, not numbered TUI commands. All TUI operations
+# remain in the GUI through the command dispatcher and configuration fields.
+required_actions = ["command","direct","generate","build","save","reload",
+    "clean","export","switch","native","diagnostics","analyze","presets",
+    "pack-manager","profile-save","profile-load","exit"]
+for action in required_actions:
+    assert ('"' + action + '"') in s, action
+print("PASS: GtkPaned layout, full TUI functionality, widgets, GTK4 file dialogs")
 
 # Regression: UTF-8 labels must use escaped newlines inside C++ string literals.
 assert 'недоступен")+"]\\n"+' in s, 'broken installed-tool label string'

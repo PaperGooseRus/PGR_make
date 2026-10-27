@@ -1,3 +1,20 @@
+# PGR_Make 0.8.0 · Hardening & CI
+
+This iteration adds a multi-platform GitHub Actions quality gate, separate module unit tests and an acceptance matrix. It retains the PGR_Make 0.7 GUI, CLI, TUI, project registry and Pack Manager. No automatic online installations are performed by default CI tests.
+
+- [Release and remaining 1.0.0 gates](RELEASE_V0_8.md)
+- [CI/CD and module test matrix](ci/README.md)
+- [Executed test report and unverified environments](TEST_REPORT_V0_8.md)
+- [Architecture fixture template](ci/architecture_matrix.example.json)
+
+**Quick local verification:** `python3 ci/verify.py` (Ninja, CMake and Python 3 required; GTK4 optional locally, mandatory in configured CI). The public Windows GUI remains unverified until the GitHub Windows job and a manual clean-machine launch are completed.
+
+---
+
+# PGR_Make 0.7 — GUI / C++17 / GTK4
+
+Изменения UX, новый рабочий сценарий и ограничения тестирования: **[RELEASE_V0_7.md](RELEASE_V0_7.md)**.
+
 > **Обновление 0.4:** общий BuildController для GUI/CLI, безопасная отмена дерева процессов, история сборок, строгий JSON-разбор, управление записями проектов и обновлённая навигация GTK4. См. [RELEASE_V0_4.md](RELEASE_V0_4.md).
 
 > **GUI 0.2:** интерфейс на GtkPaned с полным набором команд TUI описан в [GUI_PANED.md](GUI_PANED.md).

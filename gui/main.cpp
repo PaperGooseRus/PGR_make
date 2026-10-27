@@ -4,8 +4,12 @@
  * Layout: GtkPaned, editor / commands at left, project list at right.
  */
 #include <gtk/gtk.h>
+#ifndef PGR_APP_VERSION
+#define PGR_APP_VERSION "dev"
+#endif
 #include "theme.hpp"
 #include "layout_settings.hpp"
+#include "ux_model.hpp"
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -19,6 +23,7 @@
 #include <atomic>
 #include <cctype>
 #include <ctime>
+#include <chrono>
 #include <cstring>
 #include "../core/diagnostics.hpp"
 #include "../core/build_controller.hpp"
@@ -62,7 +67,14 @@ struct Gui {
     bool refreshing = false;
     bool loading = false;
     bool dirty = false;
+    bool close_dialog_open = false;
+    pgr_gui_ux::build_mode running_mode = pgr_gui_ux::build_mode::generated;
+    std::chrono::system_clock::time_point build_started{};
+    fs::path last_artifact;
+    fs::path output_directory;
+    fs::file_time_type artifact_timestamp_before = fs::file_time_type::min();
     bool busy = false;
+    bool operation_is_build = false;
     bool dark_theme = true;
     pgr_gui_layout::settings layout;
     bool restoring_layout = true;
@@ -77,6 +89,13 @@ struct Gui {
     GtkCssProvider* theme_provider = nullptr;
     GtkWidget* theme_button = nullptr;
     GtkWidget* active_project_label = nullptr;
+    GtkWidget *summary_compiler = nullptr, *summary_mode = nullptr, *summary_profile = nullptr;
+    GtkWidget *summary_cmake = nullptr, *install_missing_button = nullptr;
+    std::string missing_pin;
+    GtkWidget *validation_label = nullptr, *validation_action = nullptr;
+    GtkWidget *result_status = nullptr, *result_detail = nullptr;
+    GtkWidget *open_folder_button = nullptr, *run_artifact_button = nullptr;
+    GtkWidget *history_box = nullptr;
     GtkWidget* status_spinner = nullptr;
     std::thread worker;
     pgr_process::cancel_token cancellation;
@@ -86,7 +105,7 @@ struct Gui {
     GtkWidget* build_choice = nullptr;
     GtkWidget* dirty_indicator = nullptr;
     GtkWidget *severity_errors = nullptr, *severity_warnings = nullptr;
-    GtkWidget *history_view = nullptr;
+
     GtkWidget *window = nullptr, *project_list = nullptr, *project_path = nullptr;
     GtkWidget *status = nullptr, *left_controls = nullptr, *stop_button = nullptr;
     GtkWidget *log_view = nullptr, *diagnostics_box = nullptr, *diags_count = nullptr;
@@ -173,6 +192,8 @@ static GtkWidget* action(Gui* ui, GtkWidget* container,
                          const char* title, const char* id);
 static void show_diagnostics(Gui* ui);
 static void show_history(Gui* ui);
+static void refresh_project_summary(Gui* ui);
+static bool check_configuration(Gui* ui, bool focus_error);
 static bool save_settings(Gui* ui);
 static void load_project(Gui* ui, const project_t& project);
 static void refresh_projects(Gui* ui, const std::string& preferred = {});
@@ -185,11 +206,19 @@ static void save_layout_now(Gui* ui) {
     if (height >= 620) ui->layout.window_height = std::min(height, 2160);
     if (ui->horizontal_paned) {
         const int position = gtk_paned_get_position(GTK_PANED(ui->horizontal_paned));
-        if (position >= 600) ui->layout.projects_split = position;
+        if (position >= 600) {
+            ui->layout.projects_split = position;
+            const int available = gtk_widget_get_width(ui->horizontal_paned);
+            if (available >= 900) ui->layout.projects_permille = std::clamp(position * 1000 / available, 450, 850);
+        }
     }
     if (ui->vertical_paned && ui->layout.output_visible && !ui->output_expanded) {
         const int position = gtk_paned_get_position(GTK_PANED(ui->vertical_paned));
-        if (position >= 280) ui->layout.output_split = position;
+        if (position >= 280) {
+            ui->layout.output_split = position;
+            const int available = gtk_widget_get_height(ui->vertical_paned);
+            if (available >= 550) ui->layout.output_permille = std::clamp(position * 1000 / available, 350, 850);
+        }
     }
     if (ui->results) ui->layout.output_page = gtk_notebook_get_current_page(GTK_NOTEBOOK(ui->results));
     if (ui->category_select)
@@ -209,6 +238,23 @@ static void schedule_layout_save(Gui* ui) {
 }
 static void on_split_position(GObject*, GParamSpec*, gpointer payload) {
     schedule_layout_save(static_cast<Gui*>(payload));
+}
+// GTK allocates the panes after presentation. Restore proportions using the
+// actual allocated size, never an old absolute pixel position on a new monitor.
+static gboolean restore_split_ratios(gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    const int w = gtk_widget_get_width(ui->horizontal_paned);
+    const int h = gtk_widget_get_height(ui->vertical_paned);
+    if (w > 900) {
+        int position = std::clamp(w * ui->layout.projects_permille / 1000, 620, w - 280);
+        gtk_paned_set_position(GTK_PANED(ui->horizontal_paned), position);
+    }
+    if (h > 560) {
+        int position = std::clamp(h * ui->layout.output_permille / 1000, 285, h - 145);
+        gtk_paned_set_position(GTK_PANED(ui->vertical_paned), position);
+    }
+    ui->restoring_layout = false;
+    return G_SOURCE_REMOVE;
 }
 static void on_output_page(GtkNotebook*, GtkWidget*, guint, gpointer payload) {
     schedule_layout_save(static_cast<Gui*>(payload));
@@ -303,7 +349,7 @@ static gboolean on_global_key(GtkEventControllerKey*, guint keyval, guint,
         case GDK_KEY_j: toggle_output(nullptr, ui); return TRUE;
         case GDK_KEY_f:
             if (!ui->layout.output_visible) toggle_output(nullptr, ui);
-            gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results), 0);
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results), 1);
             gtk_widget_grab_focus(ui->log_search);
             return TRUE;
         default: return FALSE;
@@ -314,6 +360,7 @@ static void mark_dirty(Gui* ui) {
     if (ui->loading || ui->selected.name.empty()) return;
     ui->dirty = true;
     set_saved_state(ui, true);
+    refresh_project_summary(ui);
 }
 static void changed_text(GtkEditable*, gpointer data) { mark_dirty(static_cast<Gui*>(data)); }
 static void changed_buffer(GtkTextBuffer*, gpointer data) { mark_dirty(static_cast<Gui*>(data)); }
@@ -580,7 +627,7 @@ static GtkWidget* section(GtkWidget* parent, const char* title) {
     GtkWidget* exp = gtk_expander_new(title);
     gtk_widget_add_css_class(exp, "pgr-section");
     // Keep the first, most-used category immediately accessible.
-    gtk_expander_set_expanded(GTK_EXPANDER(exp), g_str_has_prefix(title, "1–4.") ? TRUE : FALSE);
+    gtk_expander_set_expanded(GTK_EXPANDER(exp), g_str_has_prefix(title, "Компилятор") ? TRUE : FALSE);
     GtkWidget* inside = column(9);
     margins(inside, 10);
     gtk_expander_set_child(GTK_EXPANDER(exp), inside);
@@ -594,14 +641,14 @@ static void add_group_choice(Gui* ui, GtkWidget* box, const char* key, const cha
     add_choice(ui, box, key, caption, values, desc);
 }
 static void build_configuration_form(Gui* ui, GtkWidget* host) {
-    GtkWidget* general = section(host, "1–4. Компилятор и язык");
-    path_field(ui, general, "compiler", "1. Компилятор (имя или полный путь)", "file");
-    action(ui, general, "31. Выбрать компилятор из Pack", "pack");
-    add_group_choice(ui, general, "standard", "2. Стандарт C++");
-    add_group_choice(ui, general, "optimization", "3. Оптимизация");
-    add_group_choice(ui, general, "debug", "4. Отладочная информация");
-    add_choice(ui, general, "c_standard", "27. Стандарт C", {"", "-std=c99", "-std=c11", "-std=c17", "-std=c23"});
-    GtkWidget* versions = section(host, "Pack Manager · версии и окружение сборки");
+    GtkWidget* general = section(host, "Компилятор и язык");
+    path_field(ui, general, "compiler", "Компилятор (имя или путь)", "file");
+    action(ui, general, "Выбрать компилятор из Pack", "pack");
+    add_group_choice(ui, general, "standard", "Стандарт C++");
+    add_group_choice(ui, general, "optimization", "Оптимизация");
+    add_group_choice(ui, general, "debug", "Отладочная информация");
+    add_choice(ui, general, "c_standard", "Стандарт C", {"", "-std=c99", "-std=c11", "-std=c17", "-std=c23"});
+    GtkWidget* versions = section(host, "Установленные инструменты и версии");
     gtk_box_append(GTK_BOX(versions),label("Закреплённые версии запускаются по абсолютным путям. Пустое значение = автоматический поиск."));
     add_choice(ui,versions,"compiler_id","Компилятор (GCC/Clang/MSVC)",ui->installed_tool_ids("compiler"));
     add_choice(ui,versions,"cmake_id","Версия CMake",ui->installed_tool_ids("cmake"));
@@ -609,50 +656,50 @@ static void build_configuration_form(Gui* ui, GtkWidget* host) {
     add_choice(ui,versions,"objcopy_id","Версия objcopy",ui->installed_tool_ids("objcopy"));
     action(ui,versions,"Открыть менеджер Pack…","pack-manager");
 
-    GtkWidget* flags = section(host, "5–10. Флаги и оптимизация");
-    add_multi(ui, flags, "warnings", "5. Предупреждения (множественный выбор)", ui->catalog.find("warnings"));
-    add_multi(ui, flags, "sanitizers", "6. Санитайзеры (множественный выбор)", ui->catalog.find("sanitizers"));
-    add_group_choice(ui, flags, "lto", "7. LTO");
-    add_group_choice(ui, flags, "arch", "8. Архитектура");
-    add_multi(ui, flags, "specific_gcc", "9. Дополнительные GCC-флаги", ui->catalog.find("specific_gcc"));
-    add_multi(ui, flags, "specific_clang", "10. Дополнительные Clang-флаги", ui->catalog.find("specific_clang"));
+    GtkWidget* flags = section(host, "Флаги и оптимизация");
+    add_multi(ui, flags, "warnings", "Предупреждения", ui->catalog.find("warnings"));
+    add_multi(ui, flags, "sanitizers", "Санитайзеры", ui->catalog.find("sanitizers"));
+    add_group_choice(ui, flags, "lto", "LTO");
+    add_group_choice(ui, flags, "arch", "Архитектура");
+    add_multi(ui, flags, "specific_gcc", "Дополнительные GCC-флаги", ui->catalog.find("specific_gcc"));
+    add_multi(ui, flags, "specific_clang", "Дополнительные Clang-флаги", ui->catalog.find("specific_clang"));
 
-    GtkWidget* files = section(host, "11–15. Исходники и пути");
-    list_field(ui, files, "source_files", "11. Исходники (по одному на строку)", "sources");
-    path_field(ui, files, "output_file", "12. Выходной файл относительно каталога проекта");
-    list_field(ui, files, "include_dirs", "13. Include dirs (по одному каталогу на строку)", "folder");
-    list_field(ui, files, "library_dirs", "14. Library dirs (по одному каталогу на строку)", "folder");
-    list_field(ui, files, "libraries", "15. Библиотеки (имя или полный путь к файлу)", "file");
+    GtkWidget* files = section(host, "Исходники, каталоги и библиотеки");
+    list_field(ui, files, "source_files", "Исходники (по одному на строку)", "sources");
+    path_field(ui, files, "output_file", "Выходной файл относительно каталога проекта");
+    list_field(ui, files, "include_dirs", "Include-каталоги (по одному на строку)", "folder");
+    list_field(ui, files, "library_dirs", "Каталоги библиотек", "folder");
+    list_field(ui, files, "libraries", "Библиотеки", "file");
 
-    GtkWidget* cmake = section(host, "22–29. CMake, пакеты и профили");
-    list_field(ui, cmake, "packages", "22. Пакеты find_package (Foo или Foo|Foo::Target)", "package");
+    GtkWidget* cmake = section(host, "CMake, зависимости и профили");
+    list_field(ui, cmake, "packages", "Пакеты find_package (Foo или Foo|Foo::Target)", "package");
     list_field(ui, cmake, "package_dirs", "Каталоги поиска CMake-пакетов (CMAKE_PREFIX_PATH)", "folder");
-    add_choice(ui, cmake, "profile", "23. Профиль", {"", "debug", "release"});
-    action(ui, cmake, "23. Сохранить профиль…", "profile-save");
-    action(ui, cmake, "23. Загрузить профиль…", "profile-load");
-    path_field(ui, cmake, "toolchain_file", "26. CMake toolchain file", "file");
-    path_field(ui, cmake, "linker_script", "28. Linker script (.ld)", "file");
-    add_choice(ui, cmake, "target_type", "29. Тип библиотеки", {"", "static", "shared", "object", "interface"});
-    path_field(ui, cmake, "toolchain_prefix", "36. Префикс кросс-компилятора");
-    add_choice(ui, cmake, "package_manager", "37. Пакетный менеджер", {"none", "vcpkg", "conan"});
-    path_field(ui, cmake, "objcopy", "38. Программа objcopy", "file");
+    add_choice(ui, cmake, "profile", "Профиль", {"", "debug", "release"});
+    action(ui, cmake, "Сохранить профиль…", "profile-save");
+    action(ui, cmake, "Загрузить профиль…", "profile-load");
+    path_field(ui, cmake, "toolchain_file", "CMake toolchain file", "file");
+    path_field(ui, cmake, "linker_script", "Linker script (.ld)", "file");
+    add_choice(ui, cmake, "target_type", "Тип библиотеки", {"", "static", "shared", "object", "interface"});
+    path_field(ui, cmake, "toolchain_prefix", "Префикс кросс-компилятора");
+    add_choice(ui, cmake, "package_manager", "Пакетный менеджер", {"none", "vcpkg", "conan"});
+    path_field(ui, cmake, "objcopy", "Программа objcopy", "file");
 
-    GtkWidget* actions = section(host, "16–38. Команды TUI");
+    GtkWidget* actions = section(host, "Дополнительные команды");
     const std::vector<std::pair<const char*, const char*>> commands = {
-        {"16. Показать команду прямой компиляции", "command"},
-        {"17. Собрать напрямую", "direct"},
-        {"18. Сгенерировать CMakeLists.txt", "generate"},
-        {"19. Собрать через PGR CMake", "build"},
-        {"20. Сохранить конфигурацию", "save"},
-        {"21. Загрузить конфигурацию", "reload"},
-        {"24. Очистить каталог сборки", "clean"},
-        {"25. Экспортировать compile_commands.json", "export"},
-        {"30. Выбрать другой проект (справа)", "switch"},
-        {"32. Собрать существующий CMakeLists.txt", "native"},
-        {"33. Показать диагностику", "diagnostics"},
-        {"34. Проверить clangd", "analyze"},
-        {"35. Создать CMakePresets.json", "presets"},
-        {"0. Выход", "exit"}
+        {"Показать команду компиляции", "command"},
+        {"Собрать напрямую", "direct"},
+        {"Сгенерировать CMakeLists.txt", "generate"},
+        {"Собрать через PGR CMake", "build"},
+        {"Сохранить конфигурацию", "save"},
+        {"Загрузить конфигурацию", "reload"},
+        {"Очистить каталог сборки", "clean"},
+        {"Экспортировать compile_commands.json", "export"},
+        {"Выбрать другой проект (справа)", "switch"},
+        {"Собрать существующий CMakeLists.txt", "native"},
+        {"Показать диагностику", "diagnostics"},
+        {"Проверить clangd", "analyze"},
+        {"Создать CMakePresets.json", "presets"},
+        {"Выход", "exit"}
     };
     for (const auto& [caption, cmd] : commands) action(ui, actions, caption, cmd);
 }
@@ -701,12 +748,23 @@ static bool save_settings(Gui* ui) {
     }
     ui->dirty = false;
     set_saved_state(ui, false);
+    refresh_project_summary(ui);
     set_status(ui, "Настройки сохранены: " + ui->selected.name);
     return true;
 }
 
 static void load_project(Gui* ui, const project_t& project) {
     ui->selected = project;
+    ui->last_artifact.clear();
+    ui->output_directory = project.build();
+    if (ui->result_status) gtk_label_set_text(GTK_LABEL(ui->result_status), "Проект готов к сборке");
+    if (ui->result_detail) gtk_label_set_text(GTK_LABEL(ui->result_detail), "Выберите режим и нажмите «Собрать».");
+    if (ui->open_folder_button) gtk_widget_set_sensitive(ui->open_folder_button, false);
+    if (ui->run_artifact_button) gtk_widget_set_sensitive(ui->run_artifact_button, false);
+    if (ui->build_choice) {
+        const auto mode = pgr_gui_ux::load_mode(project.store_root,project.source_root);
+        gtk_drop_down_set_selected(GTK_DROP_DOWN(ui->build_choice), static_cast<guint>(mode));
+    }
     if (ui->active_project_label)
         gtk_label_set_text(GTK_LABEL(ui->active_project_label), project.name.c_str());
     ui->loading = true;
@@ -760,6 +818,8 @@ static void load_project(Gui* ui, const project_t& project) {
     set_saved_state(ui, false);
     show_diagnostics(ui);
     show_history(ui);
+    refresh_project_summary(ui);
+    check_configuration(ui,false);
     set_status(ui, "Открыт проект: " + project.name);
     set_busy(ui, false);
 }
@@ -860,6 +920,9 @@ static void refresh_projects(Gui* ui, const std::string& preferred) {
         ui->selected = {};
         if (ui->active_project_label) gtk_label_set_text(GTK_LABEL(ui->active_project_label), "Нет проекта");
         gtk_label_set_text(GTK_LABEL(ui->project_path), "Проект не выбран");
+        if (ui->summary_mode) gtk_label_set_text(GTK_LABEL(ui->summary_mode), "Нет проекта");
+        if (ui->summary_compiler) gtk_label_set_text(GTK_LABEL(ui->summary_compiler), "Компилятор не выбран");
+        if (ui->summary_profile) gtk_label_set_text(GTK_LABEL(ui->summary_profile), "—");
         set_status(ui, "Создайте первый проект справа");
         set_busy(ui, false);
     }
@@ -901,22 +964,41 @@ static void show_diagnostics(Gui* ui) {
         gtk_label_set_text(GTK_LABEL(ui->diags_count), "Нет отчёта"); return;
     }
     int errors = 0, warnings = 0;
+    std::string current_file;
+    bool parent_visible=true;
+    GtkListBoxRow* first_error=nullptr;
     for (const auto& d : report.records()) {
         errors += d.severity == "error";
         warnings += d.severity == "warning";
         const bool include_error = d.severity == "error";
         const bool include_warning = d.severity == "warning";
-        if ((include_error && ui->severity_errors &&
-             !gtk_check_button_get_active(GTK_CHECK_BUTTON(ui->severity_errors))) ||
-            (include_warning && ui->severity_warnings &&
-             !gtk_check_button_get_active(GTK_CHECK_BUTTON(ui->severity_warnings)))) continue;
-        std::string message = "[" + d.severity + "/" + d.category + "] " + d.file;
+        if (include_error || include_warning) {
+            parent_visible=!(include_error && ui->severity_errors &&
+                 !gtk_check_button_get_active(GTK_CHECK_BUTTON(ui->severity_errors))) &&
+                !(include_warning && ui->severity_warnings &&
+                 !gtk_check_button_get_active(GTK_CHECK_BUTTON(ui->severity_warnings)));
+        }
+        if(!parent_visible) continue;
+        if (d.severity!="note" && !d.file.empty() && d.file!=current_file) {
+            current_file=d.file;
+            auto* group=gtk_list_box_row_new();
+            GtkWidget* heading=label(current_file.c_str());
+            gtk_widget_add_css_class(heading,"pgr-diagnostic-group");
+            margins(heading,5);
+            gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(group),heading);
+            gtk_list_box_append(GTK_LIST_BOX(ui->diagnostics_box),group);
+        }
+        std::string message = (d.severity=="note"?"↳ ":"") +
+            std::string("[") + d.severity + "/" + d.category + "] " + d.file;
         if (d.line > 0) message += ":" + std::to_string(d.line);
         if (d.column > 0) message += ":" + std::to_string(d.column);
         message += "  " + d.message;
         GtkWidget* row_widget = gtk_list_box_row_new();
-        if (d.severity == "error") gtk_widget_add_css_class(row_widget, "pgr-diagnostic-error");
-        else if (d.severity == "warning") gtk_widget_add_css_class(row_widget, "pgr-diagnostic-warning");
+        if (d.severity == "error") {
+            gtk_widget_add_css_class(row_widget, "pgr-diagnostic-error");
+            if(!first_error)first_error=GTK_LIST_BOX_ROW(row_widget);
+        } else if (d.severity == "warning") gtk_widget_add_css_class(row_widget, "pgr-diagnostic-warning");
+        else if (d.severity == "note") gtk_widget_add_css_class(row_widget, "pgr-diagnostic-note");
         GtkWidget* line = label(message.c_str());
         gtk_label_set_wrap(GTK_LABEL(line), TRUE);
         margins(line, 6);
@@ -926,6 +1008,7 @@ static void show_diagnostics(Gui* ui) {
         g_object_set_data(G_OBJECT(row_widget), "col", GINT_TO_POINTER(d.column));
         gtk_list_box_append(GTK_LIST_BOX(ui->diagnostics_box), row_widget);
     }
+    if(first_error) gtk_list_box_select_row(GTK_LIST_BOX(ui->diagnostics_box),first_error);
     gtk_label_set_text(GTK_LABEL(ui->diags_count),
         (std::to_string(errors) + " ошибок, " + std::to_string(warnings) + " предупреждений").c_str());
 }
@@ -943,29 +1026,39 @@ static void copy_diagnostic(GtkButton*,gpointer payload) {
     set_status(ui,"Сообщение скопировано");
 }
 static void show_history(Gui* ui) {
-    if (!ui->history_view) return;
-    std::ifstream file(ui->selected.store_root/"history.log",std::ios::binary);
-    if (!file) {set_text(ui->history_view,"История сборок пока пуста.");return;}
-    std::vector<std::string> lines;
-    std::string input;
-    while (std::getline(file,input)) {
-        std::istringstream row(input);
-        std::string timestamp,code,elapsed,mode;
-        if (!std::getline(row,timestamp,'\t') || !std::getline(row,code,'\t') ||
-            !std::getline(row,elapsed,'\t') || !std::getline(row,mode,'\t')) continue;
-        try {
-            const std::time_t epoch=std::stoll(timestamp)/1000;
-            char date[40]={};
-            const auto* local=std::localtime(&epoch);
-            if (local) std::strftime(date,sizeof(date),"%Y-%m-%d %H:%M:%S",local);
-            lines.push_back(std::string(date)+" | "+(code=="0"?"OK":code=="130"?"ОТМЕНА":"ОШИБКА "+code)+
-                " | "+mode+" | "+elapsed+" мс");
-        } catch (...) {}
+    if (!ui->history_box) return;
+    for (GtkWidget* child=gtk_widget_get_first_child(ui->history_box); child;) {
+        auto* next=gtk_widget_get_next_sibling(child);
+        gtk_list_box_remove(GTK_LIST_BOX(ui->history_box),child);
+        child=next;
     }
-    if (lines.size()>100) lines.erase(lines.begin(),lines.end()-100);
-    std::reverse(lines.begin(),lines.end());
-    set_text(ui->history_view,join_lines(lines));
+    if (ui->selected.name.empty()) return;
+    const auto entries=pgr_gui_ux::load_history(ui->selected.store_root/"history.log");
+    if (entries.empty()) {
+        GtkWidget* entry=gtk_list_box_row_new();
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(entry),label("История сборок пока пуста"));
+        gtk_list_box_append(GTK_LIST_BOX(ui->history_box),entry);
+        return;
+    }
+    for (const auto& h:entries) {
+        std::time_t stamp=0;
+        try {stamp=static_cast<std::time_t>(std::stoll(h.timestamp)/1000);}catch(...) {}
+        char date[40]{};
+        if (const auto* local=std::localtime(&stamp)) std::strftime(date,sizeof(date),"%d.%m.%Y %H:%M",local);
+        const std::string result=h.result=="0"?"Успешно":h.result=="130"?"Остановлено":"Ошибка "+h.result;
+        auto* line=row(18);
+        margins(line,7);
+        for (const auto& value : {std::string(date),result,h.mode,h.elapsed+" мс"}) {
+            auto* cell=label(value.c_str());
+            gtk_widget_set_hexpand(cell,TRUE);
+            gtk_box_append(GTK_BOX(line),cell);
+        }
+        auto* entry=gtk_list_box_row_new();
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(entry),line);
+        gtk_list_box_append(GTK_LIST_BOX(ui->history_box),entry);
+    }
 }
+
 struct WorkMessage {
     Gui* ui;
     std::string text;
@@ -984,6 +1077,36 @@ static gboolean work_on_main(gpointer payload) {
         set_busy(ui,false);
         show_diagnostics(ui);
         show_history(ui);
+        if (ui->result_status) gtk_label_set_text(GTK_LABEL(ui->result_status),
+            cancelled?"Операция остановлена":message->rc==0?
+            (ui->operation_is_build?"Сборка успешно завершена":"Операция выполнена"):
+            (ui->operation_is_build?"Ошибка сборки":"Ошибка операции"));
+        if (ui->result_detail) {
+            std::string info = cancelled?"Операция прервана":message->rc==0?
+                "Готово. См. журнал и артефакты ниже":"Код завершения: "+std::to_string(message->rc);
+            gtk_label_set_text(GTK_LABEL(ui->result_detail),info.c_str());
+        }
+        // Only offer executables explicitly configured by this project and
+        // actually changed by this successful direct/generated build.
+        ui->last_artifact.clear();
+        if(message->rc==0 && ui->operation_is_build && ui->running_mode!=pgr_gui_ux::build_mode::native) {
+            make_t config;
+            if(config.load(path_utf8(ui->selected.config()))==0 && !config.config().output_file.empty()) {
+                const auto candidate=pgr_gui_ux::resolved(ui->selected.source_root,config.config().output_file);
+                std::error_code ec;
+                if(fs::is_regular_file(candidate,ec) && pgr_gui_ux::is_native_executable(candidate)) {
+                    const auto modified=fs::last_write_time(candidate,ec);
+                    // C++17 file_clock and system_clock epochs differ, so instead
+                    // compare with the timestamp observed at operation start.
+                    if(!ec && (ui->artifact_timestamp_before==fs::file_time_type::min() || modified > ui->artifact_timestamp_before)) ui->last_artifact=candidate;
+                }
+            }
+        }
+        if(ui->open_folder_button) gtk_widget_set_sensitive(ui->open_folder_button,
+            fs::is_directory(ui->output_directory));
+        if(ui->run_artifact_button) gtk_widget_set_sensitive(ui->run_artifact_button,!ui->last_artifact.empty());
+        if(ui->results && message->rc!=0) gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results),2);
+        else if(ui->results) gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results),0);
     } else log_line(ui,message->text);
     return G_SOURCE_REMOVE;
 }
@@ -996,6 +1119,7 @@ static void run_pack_cli(Gui* ui, std::vector<std::string> args,const std::strin
     if(ui->worker.joinable())ui->worker.join();
     ui->cancellation.requested.store(false);
     const auto home=ui->registry.root();
+    ui->operation_is_build=false;
     gtk_text_buffer_set_text(ui->log_buffer,"",-1);
     log_line(ui,"[Pack] "+caption);
     set_busy(ui,true);
@@ -1019,11 +1143,24 @@ static void run_cli(Gui* ui,std::vector<std::string> args,const std::string& cap
     if (ui->worker.joinable()) ui->worker.join();
     ui->cancellation.requested.store(false);
     const bool main_build=std::find(args.begin(),args.end(),"--ci")!=args.end();
+    ui->operation_is_build=main_build;
     const bool direct=std::find(args.begin(),args.end(),"--direct")!=args.end();
     const bool native=std::find(args.begin(),args.end(),"--native-cmake")!=args.end();
     const project_t project=ui->selected;
     const auto home=ui->registry.root(),pack=ui->registry.pack_root();
     const auto compiler=get_entry(ui->fields.at("compiler"));
+    ui->artifact_timestamp_before = fs::file_time_type::min();
+    make_t current;
+    if(current.load(path_utf8(project.config()))==0 && !current.config().output_file.empty()) {
+        auto candidate=pgr_gui_ux::resolved(project.source_root,current.config().output_file);
+        std::error_code ec;
+        const auto previous=fs::last_write_time(candidate,ec);
+        if(!ec) ui->artifact_timestamp_before=previous;
+    }
+    make_t build_config;
+    if (build_config.load(path_utf8(project.config()))==0)
+        ui->output_directory=pgr_build::default_build_directory(project,build_config.config());
+    else ui->output_directory=project.build();
     gtk_text_buffer_set_text(ui->log_buffer,"",-1);
     log_line(ui,"[PGR] "+caption+" · "+project.name);
     set_status(ui,"Выполняется: "+caption);
@@ -1253,10 +1390,102 @@ static void category_changed(GObject*, GParamSpec*, gpointer payload) {
     update_settings_filter(ui);
     schedule_layout_save(ui);
 }
+static void refresh_project_summary(Gui* ui) {
+    if (!ui->summary_compiler) return;
+    if (ui->selected.name.empty()) return;
+    std::string compiler=get_entry(ui->fields.at("compiler"));
+    const std::string pin=choice_value(ui->singles.at("compiler_id"));
+    if(!pin.empty()) compiler=pin;
+    if(compiler.empty()) compiler="Автоматически";
+    gtk_label_set_text(GTK_LABEL(ui->summary_compiler),compiler.c_str());
+    gtk_widget_set_tooltip_text(ui->summary_compiler,compiler.c_str());
+    const auto profile=choice_value(ui->singles.at("profile"));
+    gtk_label_set_text(GTK_LABEL(ui->summary_profile),profile.empty()?"Текущие настройки":profile.c_str());
+    static const char* modes[]={"PGR CMake","Существующий CMake","Прямая сборка"};
+    const guint index=ui->build_choice?gtk_drop_down_get_selected(GTK_DROP_DOWN(ui->build_choice)):0;
+    gtk_label_set_text(GTK_LABEL(ui->summary_mode),modes[std::min(index,2u)]);
+    const auto cmake_id=choice_value(ui->singles.at("cmake_id"));
+    gtk_label_set_text(GTK_LABEL(ui->summary_cmake),
+        cmake_id.empty()?"CMake: PATH (не закреплён)":cmake_id.c_str());
+    gtk_widget_set_tooltip_text(ui->summary_cmake,
+        cmake_id.empty()?"Используется системный PATH; версия не закреплена":cmake_id.c_str());
+}
+static bool check_configuration(Gui* ui, bool focus_error) {
+    if(ui->selected.name.empty()) return false;
+    const auto mode=static_cast<pgr_gui_ux::build_mode>(
+        std::min(gtk_drop_down_get_selected(GTK_DROP_DOWN(ui->build_choice)),2u));
+    const auto issues=pgr_gui_ux::preflight(ui->selected.source_root,mode,
+        get_entry(ui->fields.at("compiler")),
+        split_lines(text_contents(ui->lists.at("source_files"))),
+        split_lines(text_contents(ui->lists.at("include_dirs"))),
+        get_entry(ui->fields.at("toolchain_file")));
+    // Show missing pinned tools early, rather than silently falling back to PATH.
+    std::vector<pgr_gui_ux::issue> all=issues;
+    ui->missing_pin.clear();
+    pgr_pack_manager::manager manager(ui->registry.pack_root(),ui->registry.root());
+    std::string error;
+    if(manager.load(error)) for (const auto& tool : {"compiler_id","cmake_id","ninja_id","objcopy_id"}) {
+        const auto id=choice_value(ui->singles.at(tool));
+        if(!id.empty()) {
+            const auto* item=manager.find(id);
+            std::error_code ec;
+            // On project load inspect only installed files. Full SHA-256 validation
+            // runs when the user explicitly checks settings or launches a build.
+            const bool installed=item && item->platform==pgr_pack_manager::platform() &&
+                fs::is_regular_file(pgr_pack_manager::executable_path(*item),ec);
+            const bool valid=installed && (!focus_error || pgr_pack_manager::verify_tool(*item,error));
+            if(!valid) {
+                if(ui->missing_pin.empty()) ui->missing_pin=id;
+                all.push_back({tool,"Версия недоступна или повреждена: "+id});
+            }
+        }
+    }
+    for(const auto& field : {"compiler","toolchain_file"})
+        gtk_widget_remove_css_class(ui->fields.at(field),"pgr-invalid");
+    for(const auto& field : {"source_files","include_dirs"})
+        gtk_widget_remove_css_class(ui->lists.at(field),"pgr-invalid");
+    for(const auto& issue:all) {
+        auto field=ui->fields.find(issue.field);
+        if(field!=ui->fields.end()) gtk_widget_add_css_class(field->second,"pgr-invalid");
+        auto list=ui->lists.find(issue.field);
+        if(list!=ui->lists.end()) gtk_widget_add_css_class(list->second,"pgr-invalid");
+    }
+    if(ui->validation_label) gtk_label_set_text(GTK_LABEL(ui->validation_label),
+        all.empty()?"✓ Основные настройки проверены":all.front().message.c_str());
+    if(ui->install_missing_button) gtk_widget_set_visible(ui->install_missing_button,
+        !ui->missing_pin.empty());
+    if(!all.empty() && focus_error) {
+        set_status(ui,all.front().message);
+        // Native CMake issues are located on the main page, other paths on paths page.
+        if(ui->category_select) gtk_drop_down_set_selected(GTK_DROP_DOWN(ui->category_select),
+            all.front().field=="build_mode"?1:all.front().field=="compiler"?1:3);
+    }
+    return all.empty();
+}
+static void open_pack_manager(Gui* ui);
+static void install_missing_clicked(GtkButton*,gpointer payload) {
+    open_pack_manager(static_cast<Gui*>(payload));
+}
+static void check_button_clicked(GtkButton*,gpointer payload) {
+    auto* ui=static_cast<Gui*>(payload);
+    if(check_configuration(ui,true)) set_status(ui,"Основные пути и закреплённые инструменты проверены");
+}
+static void on_mode_changed(GObject*,GParamSpec*,gpointer data) {
+    auto* ui=static_cast<Gui*>(data);
+    if(!ui->loading && !ui->selected.name.empty() && ui->build_choice) {
+        const guint index=gtk_drop_down_get_selected(GTK_DROP_DOWN(ui->build_choice));
+        if(!pgr_gui_ux::save_mode(ui->selected.store_root,
+               static_cast<pgr_gui_ux::build_mode>(std::min(index,2u))))
+            set_status(ui,"Не удалось сохранить режим сборки");
+    }
+    refresh_project_summary(ui);
+}
 static void primary_build(GtkButton*,gpointer data) {
     auto* ui=static_cast<Gui*>(data);
-    if (ui->busy || ui->selected.name.empty() || !save_settings(ui)) return;
+    if (ui->busy || ui->selected.name.empty()) return;
+    if (!check_configuration(ui,true) || !save_settings(ui)) return;
     guint mode=gtk_drop_down_get_selected(GTK_DROP_DOWN(ui->build_choice));
+    ui->running_mode=static_cast<pgr_gui_ux::build_mode>(std::min(mode,2u));
     if (mode==1) run_cli(ui,{"--ci","--native-cmake"},"Сборка существующего CMake");
     else if (mode==2) run_cli(ui,{"--ci","--direct"},"Прямая сборка");
     else run_cli(ui,{"--ci"},"Сборка PGR CMake");
@@ -1474,6 +1703,12 @@ static void open_pack_manager(Gui* ui) {
     GtkWidget* body=column(10);margins(body,16);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),body);
     gtk_window_set_child(GTK_WINDOW(window),scroll);
+    if(!ui->missing_pin.empty()) {
+        auto* missing=label(("Требуется проекту: "+ui->missing_pin+". Проверьте доступные версии ниже.").c_str());
+        gtk_label_set_wrap(GTK_LABEL(missing),TRUE);
+        gtk_widget_add_css_class(missing,"pgr-validation-label");
+        gtk_box_append(GTK_BOX(body),missing);
+    }
     GtkWidget* heading=label("Установленные инструменты");gtk_widget_add_css_class(heading,"title-3");gtk_box_append(GTK_BOX(body),heading);
     if(manager.entries().empty())gtk_box_append(GTK_BOX(body),label("Нет зарегистрированных версий. Можно импортировать архив или установить из каталога."));
     for(const auto& installed:manager.entries()) {
@@ -1492,6 +1727,8 @@ static void open_pack_manager(Gui* ui) {
     gtk_widget_add_css_class(catalog_title,"title-3");gtk_box_append(GTK_BOX(body),catalog_title);
     std::vector<pgr_pack_manager::package> available=pgr_pack_manager::catalog(manager.catalog_file(),error);
     if(!error.empty())gtk_box_append(GTK_BOX(body),label(error.c_str()));
+    if(!ui->missing_pin.empty()) std::stable_partition(available.begin(),available.end(),
+        [ui](const auto& p){return p.id==ui->missing_pin;});
     for(const auto& pkg:available) {
         GtkWidget* line=row(8);
         GtkWidget* desc=label((pkg.id+"\n"+pkg.url).c_str());
@@ -1513,8 +1750,6 @@ static void run_action(GtkButton*, gpointer payload) {
     auto* ui = pair->first;
     const std::string& id = pair->second;
     if (id == "exit") {
-        if (ui->busy) {ui->cancellation.cancel();return;}
-        if (ui->dirty) {set_status(ui,"Изменения не сохранены. Сохраните настройки перед выходом.");return;}
         gtk_window_close(GTK_WINDOW(ui->window)); return;
     }
     if (id == "new") { open_create_dialog(ui); return; }
@@ -1522,10 +1757,7 @@ static void run_action(GtkButton*, gpointer payload) {
         if (!ui->busy && !ui->selected.name.empty()) load_project(ui,ui->selected);
         return;
     }
-    if (id == "exit-discard") {
-        if (!ui->busy) { ui->dirty=false;gtk_window_close(GTK_WINDOW(ui->window)); }
-        return;
-    }
+    if (id == "exit-discard") { gtk_window_close(GTK_WINDOW(ui->window)); return; }
     if (id == "pack-check") {open_pack_manager(ui);return;}
     if (id == "pack-manager") {open_pack_manager(ui);return;}
     if (id == "refresh") {
@@ -1539,7 +1771,7 @@ static void run_action(GtkButton*, gpointer payload) {
     if (id == "pack") { open_pack_dialog(ui); return; }
     if (id == "profile-save") { open_save_profile(ui); return; }
     if (id == "profile-load") { open_load_profile(ui); return; }
-    if (id == "diagnostics") { show_diagnostics(ui); gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results), 1); return; }
+    if (id == "diagnostics") { show_diagnostics(ui); gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results), 2); return; }
     if (id == "reload") { if (ui->dirty) {set_status(ui,"Не сохранено: сохраните либо переключите проект с выбором «Без сохранения»");return;} if (!ui->selected.name.empty()) load_project(ui, ui->selected); return; }
     if (id == "save") { save_settings(ui); return; }
     if (id == "stop") {
@@ -1548,9 +1780,9 @@ static void run_action(GtkButton*, gpointer payload) {
     }
     if (ui->busy || !save_settings(ui)) return;
     if (id == "clean") { confirm_clean(nullptr, ui); return; }
-    if (id == "build") run_cli(ui, {"--ci"}, "CMake-сборка");
-    else if (id == "direct") run_cli(ui, {"--ci", "--direct"}, "Прямая компиляция");
-    else if (id == "native") run_cli(ui, {"--ci", "--native-cmake"}, "Существующий CMakeLists.txt");
+    if (id == "build") {ui->running_mode=pgr_gui_ux::build_mode::generated;run_cli(ui, {"--ci"}, "CMake-сборка");}
+    else if (id == "direct") {ui->running_mode=pgr_gui_ux::build_mode::direct;run_cli(ui, {"--ci", "--direct"}, "Прямая компиляция");}
+    else if (id == "native") {ui->running_mode=pgr_gui_ux::build_mode::native;run_cli(ui, {"--ci", "--native-cmake"}, "Существующий CMakeLists.txt");}
     else if (id == "generate") run_cli(ui, {"--generate-only"}, "Генерация CMakeLists.txt");
     else if (id == "command") run_cli(ui, {"--show-command"}, "Команда компиляции");
     else if (id == "export") run_cli(ui, {"--export-commands"}, "Экспорт compile_commands.json");
@@ -1572,24 +1804,92 @@ static GtkWidget* action(Gui* ui, GtkWidget* container, const char* title, const
     }
     return button;
 }
+// One closure path for the window controls and menu action. Never discard
+// modified compiler settings without an explicit decision from the user.
+struct CloseDialogState { Gui* ui; GtkWidget* dialog; };
+static void close_dialog_destroy(gpointer payload) {
+    auto* state=static_cast<CloseDialogState*>(payload);
+    state->ui->close_dialog_open=false;
+    delete state;
+}
+static void close_with_layout(Gui* ui) {
+    if(ui->layout_save_source) {
+        g_source_remove(ui->layout_save_source);
+        ui->layout_save_source=0;
+    }
+    save_layout_now(ui);
+    gtk_window_destroy(GTK_WINDOW(ui->window));
+}
+static void close_dialog_button(GtkButton* button,gpointer payload) {
+    auto* state=static_cast<CloseDialogState*>(payload);
+    Gui* ui=state->ui;
+    const char* kind=static_cast<const char*>(g_object_get_data(G_OBJECT(button),"close-kind"));
+    const std::string decision=kind?kind:"cancel";
+    if(decision=="save" && !save_settings(ui)) return;
+    const bool finish=(decision=="save"||decision=="discard");
+    gtk_window_destroy(GTK_WINDOW(state->dialog));
+    if(finish) close_with_layout(ui);
+}
 static gboolean on_close_request(GtkWindow*,gpointer payload) {
     auto* ui=static_cast<Gui*>(payload);
     if (ui->busy) {
         ui->cancellation.cancel();
-        set_status(ui,"Остановка процесса перед закрытием. Закройте окно после завершения.");
+        set_status(ui,"Останавливаю сборку. Закройте окно после завершения.");
         return TRUE;
     }
     if (ui->dirty) {
-        set_status(ui,"Есть несохранённые настройки. Сохраните их либо выберите «Выход» ещё раз.");
-        // Explicit close via the window manager does not auto-write config.
+        if(ui->close_dialog_open) return TRUE;
+        ui->close_dialog_open=true;
+        GtkWidget* dialog=gtk_window_new();
+        auto* state=new CloseDialogState{ui,dialog};
+        g_object_set_data_full(G_OBJECT(dialog),"pgr-close",state,close_dialog_destroy);
+        gtk_window_set_title(GTK_WINDOW(dialog),"Несохранённые изменения");
+        gtk_window_set_modal(GTK_WINDOW(dialog),TRUE);
+        gtk_window_set_transient_for(GTK_WINDOW(dialog),GTK_WINDOW(ui->window));
+        gtk_window_set_default_size(GTK_WINDOW(dialog),420,150);
+        GtkWidget* body=column(12);margins(body,18);
+        gtk_window_set_child(GTK_WINDOW(dialog),body);
+        auto* prompt=label("Сохранить изменения конфигурации перед выходом?");
+        gtk_label_set_wrap(GTK_LABEL(prompt),TRUE);
+        gtk_box_append(GTK_BOX(body),prompt);
+        GtkWidget* buttons=row(8);
+        for(auto& item:std::vector<std::pair<const char*,const char*>>{
+            {"Сохранить","save"},{"Не сохранять","discard"},{"Отмена","cancel"}}) {
+            auto* button=gtk_button_new_with_label(item.first);
+            g_object_set_data(G_OBJECT(button),"close-kind",const_cast<char*>(item.second));
+            g_signal_connect(button,"clicked",G_CALLBACK(close_dialog_button),state);
+            gtk_box_append(GTK_BOX(buttons),button);
+        }
+        gtk_box_append(GTK_BOX(body),buttons);
+        gtk_window_present(GTK_WINDOW(dialog));
         return TRUE;
     }
-    if (ui->layout_save_source) {
-        g_source_remove(ui->layout_save_source);
-        ui->layout_save_source = 0;
-    }
+    if (ui->layout_save_source) {g_source_remove(ui->layout_save_source);ui->layout_save_source=0;}
     save_layout_now(ui);
     return FALSE;
+}
+
+static void open_build_folder(GtkButton*,gpointer payload) {
+    auto* ui=static_cast<Gui*>(payload);
+    if(!fs::is_directory(ui->output_directory)) {set_status(ui,"Каталог сборки ещё не создан");return;}
+    GFile* file=g_file_new_for_path(path_utf8(ui->output_directory).c_str());
+    gchar* uri=g_file_get_uri(file);
+    GError* error=nullptr;
+    if(!g_app_info_launch_default_for_uri(uri,nullptr,&error)) {
+        set_status(ui,std::string("Не удалось открыть папку: ")+(error?error->message:"unknown"));
+        g_clear_error(&error);
+    }
+    g_free(uri);g_object_unref(file);
+}
+static void run_built_executable(GtkButton*,gpointer payload) {
+    auto* ui=static_cast<Gui*>(payload);
+    if(ui->last_artifact.empty() || !pgr_gui_ux::is_native_executable(ui->last_artifact)) return;
+    const auto exe=path_utf8(ui->last_artifact);
+    const char* argv[]={exe.c_str(),nullptr};
+    GError* error=nullptr;
+    GSubprocess* child=g_subprocess_newv(argv,G_SUBPROCESS_FLAGS_NONE,&error);
+    if(child) {g_object_unref(child);set_status(ui,"Запущен результат: "+exe);}
+    else {set_status(ui,std::string("Не удалось запустить: ")+(error?error->message:"unknown"));g_clear_error(&error);}
 }
 static void activate(GtkApplication* app, gpointer payload) {
     auto* ui = static_cast<Gui*>(payload);
@@ -1629,7 +1929,7 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_widget_add_css_class(subtitle, "pgr-subtitle");
     gtk_box_append(GTK_BOX(brand_text), subtitle);
     gtk_box_append(GTK_BOX(header), brand_text);
-    GtkWidget* version = label("0.5 · GTK4");
+    GtkWidget* version = label(PGR_APP_VERSION " · GTK4");
     gtk_widget_add_css_class(version, "pgr-pill");
     gtk_box_append(GTK_BOX(header), version);
     GtkWidget* header_gap = column();
@@ -1685,6 +1985,7 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_widget_set_tooltip_text(ui->build_choice, "Способ сборки проекта");
     gtk_widget_set_hexpand(ui->build_choice, TRUE);
     gtk_box_append(GTK_BOX(top_commands), ui->build_choice);
+    g_signal_connect(ui->build_choice,"notify::selected",G_CALLBACK(on_mode_changed),ui);
     GtkWidget* primary = gtk_button_new_with_label("▶ Собрать");
     gtk_widget_add_css_class(primary, "suggested-action");
     gtk_widget_add_css_class(primary, "pgr-build");
@@ -1702,6 +2003,26 @@ static void activate(GtkApplication* app, gpointer payload) {
     // Global toolbar is independent of the two workspace panes.
     gtk_box_insert_child_after(GTK_BOX(root), top_commands,
                                gtk_widget_get_first_child(root));
+    GtkWidget* summary=row(16);
+    gtk_widget_add_css_class(summary,"pgr-project-summary");
+    auto summary_item=[&](const char* caption,GtkWidget** output) {
+        auto* cell=column(3);
+        auto* heading=label(caption);
+        gtk_widget_add_css_class(heading,"pgr-meta");
+        gtk_box_append(GTK_BOX(cell),heading);
+        *output=label("—");
+        gtk_label_set_ellipsize(GTK_LABEL(*output),PANGO_ELLIPSIZE_END);
+        gtk_label_set_max_width_chars(GTK_LABEL(*output),28);
+        gtk_widget_add_css_class(*output,"pgr-summary-value");
+        gtk_box_append(GTK_BOX(cell),*output);
+        gtk_widget_set_hexpand(cell,TRUE);
+        gtk_box_append(GTK_BOX(summary),cell);
+    };
+    summary_item("КОМПИЛЯТОР",&ui->summary_compiler);
+    summary_item("CMAKE",&ui->summary_cmake);
+    summary_item("РЕЖИМ",&ui->summary_mode);
+    summary_item("ПРОФИЛЬ",&ui->summary_profile);
+    gtk_box_insert_child_after(GTK_BOX(root),summary,top_commands);
 
     GtkWidget* controls = gtk_scrolled_window_new();
     gtk_widget_set_vexpand(controls, TRUE);
@@ -1721,6 +2042,20 @@ static void activate(GtkApplication* app, gpointer payload) {
     g_object_set(G_OBJECT(ui->settings_search), "placeholder-text", "Поиск настроек…", nullptr);
     gtk_box_append(GTK_BOX(settings_header), ui->settings_search);
     gtk_box_append(GTK_BOX(left), settings_header);
+    GtkWidget* validate_row=row(8);
+    ui->validation_label=label("Проверка конфигурации ещё не выполнялась");
+    gtk_widget_add_css_class(ui->validation_label,"pgr-validation-label");
+    gtk_widget_set_hexpand(ui->validation_label,TRUE);
+    gtk_label_set_wrap(GTK_LABEL(ui->validation_label),TRUE);
+    gtk_box_append(GTK_BOX(validate_row),ui->validation_label);
+    ui->validation_action=gtk_button_new_with_label("Проверить");
+    g_signal_connect(ui->validation_action,"clicked",G_CALLBACK(check_button_clicked),ui);
+    gtk_box_append(GTK_BOX(validate_row),ui->validation_action);
+    ui->install_missing_button=gtk_button_new_with_label("Найти инструмент в Pack");
+    gtk_widget_set_visible(ui->install_missing_button,FALSE);
+    g_signal_connect(ui->install_missing_button,"clicked",G_CALLBACK(install_missing_clicked),ui);
+    gtk_box_append(GTK_BOX(validate_row),ui->install_missing_button);
+    gtk_box_append(GTK_BOX(left),validate_row);
     g_signal_connect(ui->settings_search, "changed", G_CALLBACK(settings_search_changed), ui);
     g_signal_connect(ui->category_select, "notify::selected", G_CALLBACK(category_changed), ui);
     gtk_box_append(GTK_BOX(left), controls);
@@ -1765,6 +2100,26 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_widget_set_vexpand(ui->results, TRUE);
     gtk_widget_add_css_class(ui->results, "pgr-results");
     g_signal_connect(ui->results, "switch-page", G_CALLBACK(on_output_page), ui);
+    GtkWidget* result_page=column(12);
+    margins(result_page,15);
+    gtk_widget_add_css_class(result_page,"pgr-result-card");
+    ui->result_status=label("Проект готов к сборке");
+    gtk_widget_add_css_class(ui->result_status,"pgr-result-title");
+    gtk_box_append(GTK_BOX(result_page),ui->result_status);
+    ui->result_detail=label("Выберите режим и нажмите «Собрать».");
+    gtk_label_set_wrap(GTK_LABEL(ui->result_detail),TRUE);
+    gtk_box_append(GTK_BOX(result_page),ui->result_detail);
+    GtkWidget* result_actions=row(10);
+    ui->open_folder_button=gtk_button_new_with_label("Открыть каталог сборки");
+    gtk_widget_set_sensitive(ui->open_folder_button,FALSE);
+    gtk_box_append(GTK_BOX(result_actions),ui->open_folder_button);
+    ui->run_artifact_button=gtk_button_new_with_label("Запустить EXE");
+    gtk_widget_set_sensitive(ui->run_artifact_button,FALSE);
+    gtk_box_append(GTK_BOX(result_actions),ui->run_artifact_button);
+    g_signal_connect(ui->open_folder_button,"clicked",G_CALLBACK(open_build_folder),ui);
+    g_signal_connect(ui->run_artifact_button,"clicked",G_CALLBACK(run_built_executable),ui);
+    gtk_box_append(GTK_BOX(result_page),result_actions);
+    gtk_notebook_append_page(GTK_NOTEBOOK(ui->results),result_page,gtk_label_new("Результат"));
     ui->log_view = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(ui->log_view), FALSE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(ui->log_view), TRUE);
@@ -1805,10 +2160,10 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(errors_scroll), errors);
     gtk_notebook_append_page(GTK_NOTEBOOK(ui->results), errors_scroll, gtk_label_new("Диагностика"));
     GtkWidget* history_scroller=gtk_scrolled_window_new();
-    ui->history_view=gtk_text_view_new();
-    gtk_text_view_set_editable(GTK_TEXT_VIEW(ui->history_view),FALSE);
-    gtk_text_view_set_monospace(GTK_TEXT_VIEW(ui->history_view),TRUE);
-    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(history_scroller),ui->history_view);
+    ui->history_box=gtk_list_box_new();
+    gtk_widget_add_css_class(ui->history_box,"pgr-history-list");
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(ui->history_box),GTK_SELECTION_NONE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(history_scroller),ui->history_box);
     gtk_notebook_append_page(GTK_NOTEBOOK(ui->results),history_scroller,gtk_label_new("История"));
     gtk_box_append(GTK_BOX(output), ui->results);
     gtk_paned_set_end_child(GTK_PANED(vertical), output);
@@ -1863,7 +2218,7 @@ static void activate(GtkApplication* app, gpointer payload) {
     GtkWidget* app_actions = column(6);
     margins(app_actions, 8);
     action(ui,app_actions,"Выход","exit");
-    action(ui,app_actions,"Выход без сохранения","exit-discard");
+
     gtk_expander_set_child(GTK_EXPANDER(manage_app), app_actions);
     gtk_box_append(GTK_BOX(right), manage_app);
 
@@ -1876,16 +2231,17 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_widget_set_visible(ui->status_spinner, FALSE);
     gtk_box_append(GTK_BOX(footer), ui->status_spinner);
     ui->status = label("Готово");
+    gtk_label_set_ellipsize(GTK_LABEL(ui->status),PANGO_ELLIPSIZE_END);
     gtk_widget_add_css_class(ui->status, "pgr-meta");
     gtk_widget_set_hexpand(ui->status, TRUE);
     gtk_box_append(GTK_BOX(footer), ui->status);
-    gtk_box_append(GTK_BOX(footer), label("PGR · C++17 / GTK4"));
+    gtk_box_append(GTK_BOX(footer), label("PGR_Make " PGR_APP_VERSION " · GTK4"));
     gtk_box_append(GTK_BOX(root), footer);
     update_settings_filter(ui);
     refresh_projects(ui);
     log_line(ui, "PGR_Make GTK4: рабочая область и журнал разделены двумя GtkPaned.");
     gtk_window_present(GTK_WINDOW(ui->window));
-    ui->restoring_layout = false;
+    g_idle_add(restore_split_ratios,ui);
 }
 int main(int argc, char** argv) {
     (void)argc; (void)argv;

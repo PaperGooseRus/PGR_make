@@ -1,0 +1,169 @@
+name: Quality Gate
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  linux:
+    name: Linux · ${{ matrix.compiler }} · CLI + GTK4 + tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler, GTK4, build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake pkg-config libgtk-4-dev python3 clang g++
+      - name: Configure (GUI and Python tests mandatory)
+        env:
+          CC: ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }}
+          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+        run: |
+          cmake -S . -B build-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPGR_BUILD_GUI=ON -DPGR_REQUIRE_GUI=ON \
+            -DPGR_REQUIRE_PYTHON_TESTS=ON -DBUILD_TESTING=ON
+      - name: Build CLI, GUI, and unit binaries
+        run: cmake --build build-ci --parallel 2
+      - name: Run all registered tests
+        run: ctest --test-dir build-ci --output-on-failure --parallel 2 --timeout 180
+      - name: Capture CTest reports
+        if: always()
+        run: ctest --test-dir build-ci -T Test --no-compress-output || true
+      - name: Upload test diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.compiler }}-test-logs
+          path: |
+            build-ci/Testing/
+            build-ci/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: ignore
+
+  windows:
+    name: Windows · UCRT64 · GTK4 + unit + acceptance
+    runs-on: windows-2022
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          cache: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-gtk4
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-binutils
+      - name: Configure (GUI and Python tests mandatory)
+        run: |
+          cmake -S . -B build-ci -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPGR_STATIC_WINDOWS=ON \
+            -DPGR_BUILD_GUI=ON -DPGR_REQUIRE_GUI=ON \
+            -DPGR_REQUIRE_PYTHON_TESTS=ON -DBUILD_TESTING=ON
+      - name: Build Windows CLI and GTK4 GUI
+        run: cmake --build build-ci --parallel 2
+      - name: Full Windows test suite (native units + CLI/Pack/acceptance)
+        run: ctest --test-dir build-ci --output-on-failure --parallel 2 --timeout 180
+      - name: CLI smoke test
+        run: ./build-ci/PGR_Make.exe --help
+      - name: Stage portable Windows package
+        run: |
+          mkdir -p stage/PGR/Pack stage/PGR/Project stage/PGR/tools stage/PGR/docs
+          cp build-ci/PGR_Make.exe build-ci/PGR_Make_GUI.exe stage/PGR/
+          cp start_gui.bat stage/PGR/
+          cp tools/zip_guard.ps1 tools/catalog.json stage/PGR/tools/
+          cp README.md PACK_MANAGER.md RELEASE_V0_8.md THIRD_PARTY_NOTICES.md stage/PGR/docs/
+          cp deploy/PGR/Pack/README.txt stage/PGR/Pack/
+          cp deploy/PGR/Project/README.txt stage/PGR/Project/
+          powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+            -File tools/bundle_gtk_runtime.ps1 \
+            -Ucrt "$(cygpath -w /ucrt64)" \
+            -Deploy "$(cygpath -w "$PWD/stage/PGR")"
+      - name: Compress portable package and record checksum
+        shell: pwsh
+        run: |
+          $cmake = Get-Content CMakeLists.txt -Raw
+          $match = [regex]::Match($cmake, 'project\(PGR_Make VERSION (\d+\.\d+\.\d+)')
+          if (-not $match.Success) { throw 'Project version missing in CMakeLists.txt' }
+          $name = "PGR_Make_$($match.Groups[1].Value)_Windows_x64.zip"
+          Compress-Archive -Path stage/PGR -DestinationPath $name
+          ((Get-FileHash $name -Algorithm SHA256).Hash.ToLower() + '  ' + $name) | Set-Content -Encoding ascii SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PGR_Make_windows_x64_candidate
+          path: |
+            PGR_Make_0.8.0_Windows_x64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Capture CTest reports
+        if: always()
+        run: ctest --test-dir build-ci -T Test --no-compress-output || true
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-logs
+          path: build-ci/Testing/
+          if-no-files-found: ignore
+
+  draft-release:
+    name: CD · draft release (tag only)
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: PGR_Make_windows_x64_candidate
+          path: dist
+      - name: Validate tag and artifact checksum
+        run: |
+          version=$(sed -nE 's/^project\(PGR_Make VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' CMakeLists.txt)
+          test -n "$version"
+          test "$GITHUB_REF_NAME" = "v$version"
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          test -s "dist/PGR_Make_${version}_Windows_x64.zip"
+      - name: Create draft only, never auto-publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(sed -nE 's/^project\(PGR_Make VERSION ([0-9]+\.[0-9]+\.[0-9]+) .*/\1/p' CMakeLists.txt)
+          if gh release view "$GITHUB_REF_NAME" --json isDraft --jq '.isDraft' >draft_state.txt 2>/dev/null; then
+            test "$(cat draft_state.txt)" = "true"
+            gh release upload "$GITHUB_REF_NAME" \
+              "dist/PGR_Make_${version}_Windows_x64.zip" dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "dist/PGR_Make_${version}_Windows_x64.zip" dist/SHA256SUMS.txt \
+              --title "PGR_Make $GITHUB_REF_NAME (candidate)" \
+              --notes-file RELEASE_V0_8.md --draft --verify-tag
+          fi
