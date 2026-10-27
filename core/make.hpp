@@ -167,15 +167,20 @@ class make_t {
             std::vector<std::string> library_dirs;   ///< -L<dir>
             std::vector<std::string> libraries;      ///< -l<name> или готовый флаг
 
+            std::vector<std::string> package_dirs; ///< Additional CMAKE_PREFIX_PATH directories
             std::vector<std::string> packages; ///< "name" или "name|target::name"
             std::string profile;               ///< "debug" / "release" / "" (custom)
             std::string toolchain_file;        ///< CMake toolchain for cross-compilation
             std::string c_standard;            ///< e.g. c11 / -std=c11
             std::string linker_script;         ///< embedded linker script (.ld)
-            std::string target_type;           ///< static or shared for library targets
+            std::string target_type;           ///< static/shared/object/interface for libraries
+            std::string toolchain_prefix;     ///< e.g. arm-none-eabi-
+            std::string objcopy;              ///< optional objcopy executable
+            std::string package_manager;      ///< none / vcpkg / conan
+            std::string compiler_id, cmake_id, ninja_id, objcopy_id; ///< pinned Pack entries
             bool operator==(const config_t& o) const {
-                return std::tie(compiler, source_files, output_file, standard, optimization, debug, lto, arch, warnings, sanitizers, specific_gcc, specific_clang, include_dirs, library_dirs, libraries, packages, profile, toolchain_file, c_standard, linker_script, target_type) ==
-                    std::tie(o.compiler, o.source_files, o.output_file, o.standard, o.optimization, o.debug, o.lto, o.arch, o.warnings, o.sanitizers, o.specific_gcc, o.specific_clang, o.include_dirs, o.library_dirs, o.libraries, o.packages, o.profile, o.toolchain_file, o.c_standard, o.linker_script, o.target_type);
+                return std::tie(compiler, source_files, output_file, standard, optimization, debug, lto, arch, warnings, sanitizers, specific_gcc, specific_clang, include_dirs, library_dirs, libraries, packages, package_dirs, profile, toolchain_file, c_standard, linker_script, target_type, toolchain_prefix, objcopy, package_manager, compiler_id, cmake_id, ninja_id, objcopy_id) ==
+                    std::tie(o.compiler, o.source_files, o.output_file, o.standard, o.optimization, o.debug, o.lto, o.arch, o.warnings, o.sanitizers, o.specific_gcc, o.specific_clang, o.include_dirs, o.library_dirs, o.libraries, o.packages, o.package_dirs, o.profile, o.toolchain_file, o.c_standard, o.linker_script, o.target_type, o.toolchain_prefix, o.objcopy, o.package_manager, o.compiler_id, o.cmake_id, o.ninja_id, o.objcopy_id);
             }
             bool operator!=(const config_t& o) const { return !(*this == o); }
         };
@@ -226,8 +231,6 @@ class make_t {
                 (has_san("-fsanitize=thread") && has_san("-fsanitize=leak"))) return 0x06;
             if (cfg_.lto == "-flto=thin" && cfg_.compiler.find("clang") == std::string::npos &&
                 cfg_.toolchain_file.empty()) return 0x06;
-            if (!cfg_.target_type.empty() && cfg_.target_type != "static" && cfg_.target_type != "shared")
-                return 0x06;
             for (const auto& flag : {cfg_.standard, cfg_.optimization, cfg_.debug,
                                      cfg_.lto, cfg_.arch, cfg_.c_standard})
                 if (!flag.empty() && !safe_flag(flag)) return 0x06;
@@ -235,7 +238,7 @@ class make_t {
                                     cfg_.specific_gcc, cfg_.specific_clang})
                 for (const auto& flag : vec) if (!safe_flag(flag)) return 0x06;
             for (const auto& vec : {cfg_.source_files, cfg_.include_dirs,
-                                    cfg_.library_dirs, cfg_.libraries})
+                                    cfg_.library_dirs, cfg_.libraries, cfg_.package_dirs})
                 for (const auto& v : vec)
                     if (v.find_first_of("\r\n") != std::string::npos) return 0x06;
             for (const auto& pkg : cfg_.packages) {
@@ -244,7 +247,15 @@ class make_t {
                     if (!std::isalnum(c) && c != '_' && c != '-' && c != '+' &&
                         c != '.' && c != ':' && c != '|' && c != '/') return 0x06;
             }
-            if (cfg_.toolchain_file.find_first_of("\r\n") != std::string::npos ||
+            if (!cfg_.package_manager.empty() && cfg_.package_manager != "none" &&
+                cfg_.package_manager != "vcpkg" && cfg_.package_manager != "conan") return 0x06;
+            if (!cfg_.target_type.empty() && cfg_.target_type != "static" &&
+                cfg_.target_type != "shared" && cfg_.target_type != "object" &&
+                cfg_.target_type != "interface") return 0x06;
+            if (cfg_.toolchain_prefix.find_first_of("\r\n") != std::string::npos ||
+                cfg_.objcopy.find_first_of("\r\n") != std::string::npos ||
+                cfg_.package_manager.find_first_of("\r\n") != std::string::npos ||
+                cfg_.toolchain_file.find_first_of("\r\n") != std::string::npos ||
                 cfg_.linker_script.find_first_of("\r\n") != std::string::npos ||
                 cfg_.output_file.find_first_of("\r\n") != std::string::npos)
                 return 0x06;
@@ -271,11 +282,18 @@ class make_t {
         void set_libraries(const std::vector<std::string>& v)      { cfg_.libraries      = v; }
     
         void set_packages(const std::vector<std::string>& v) { cfg_.packages = v; }
+        void set_package_dirs(const std::vector<std::string>& v) { cfg_.package_dirs = v; }
         void set_profile(const std::string& v)               { cfg_.profile  = v; }
         void set_toolchain_file(const std::string& v)        { cfg_.toolchain_file = v; }
         void set_c_standard(const std::string& v)            { cfg_.c_standard = v; }
         void set_linker_script(const std::string& v)         { cfg_.linker_script = v; }
         void set_target_type(const std::string& v)           { cfg_.target_type = v; }
+        void set_toolchain_prefix(const std::string& v) { cfg_.toolchain_prefix = v; }
+        void set_objcopy(const std::string& v) { cfg_.objcopy = v; }
+        void set_package_manager(const std::string& v) { cfg_.package_manager = v; }
+        void set_pins(const std::string& cc,const std::string& cm,const std::string& nj,const std::string& oc) {
+            cfg_.compiler_id=cc;cfg_.cmake_id=cm;cfg_.ninja_id=nj;cfg_.objcopy_id=oc;
+        }
         /// @}
 
         /// @brief Доступ к текущей конфигурации.
@@ -367,8 +385,35 @@ class make_t {
                 return 0x06;
             }
 
-            // 3. Сборка в правильном порядке.
-            args_.push_back(cfg_.compiler);
+            // 3. Compiler backend. MSVC uses entirely different CLI syntax.
+            if (pgr_toolchain::classify(cfg_.compiler) == pgr_toolchain::family::msvc) {
+                if (!cfg_.sanitizers.empty() || !cfg_.specific_gcc.empty() ||
+                    !cfg_.specific_clang.empty() || !cfg_.lto.empty() ||
+                    !cfg_.arch.empty() || !cfg_.linker_script.empty()) {
+                    std::cerr << "MSVC: unsupported GCC-specific options in this profile\n";
+                    return 0x06;
+                }
+                args_ = {cfg_.compiler, "/nologo", "/EHsc", "/W4"};
+                if (cfg_.optimization == "-O2" || cfg_.optimization == "-O3") args_.push_back("/O2");
+                else if (cfg_.optimization == "-O1" || cfg_.optimization == "-Os") args_.push_back("/O1");
+                else args_.push_back("/Od");
+                if (!cfg_.debug.empty() && cfg_.debug != "-g0") args_.push_back("/Zi");
+                if (!cfg_.standard.empty()) {
+                    auto at=cfg_.standard.find("c++");
+                    if (at != std::string::npos) args_.push_back("/std:c++" + cfg_.standard.substr(at+3));
+                }
+                for (const auto& dir:cfg_.include_dirs) args_.push_back("/I" + dir);
+                for (const auto& src:cfg_.source_files)
+                    args_.push_back((std::filesystem::u8path(src).extension() == ".c" ? "/Tc" : "/Tp") + src);
+                if (!cfg_.output_file.empty()) args_.push_back("/Fe:" + cfg_.output_file);
+                if (!cfg_.library_dirs.empty() || !cfg_.libraries.empty()) {
+                    args_.push_back("/link");
+                    for (const auto& dir:cfg_.library_dirs) args_.push_back("/LIBPATH:" + dir);
+                    for (const auto& lib:cfg_.libraries) args_.push_back(lib);
+                }
+                return 0;
+            }
+            args_.push_back(pgr_toolchain::selected_compiler(cfg_.compiler, cfg_.toolchain_prefix));
 
             auto add = [this](const std::string& s) {
                 if (!s.empty()) args_.push_back(s);
@@ -441,8 +486,10 @@ class make_t {
                                  "metacharacters: " << lib << '\n';
                     return 0x06;
                 }
-                if (lib[0] == '-') args_.push_back(lib);
-                else               args_.push_back("-l" + lib);
+                if (lib[0] == '-' || lib.find('/') != std::string::npos ||
+                    lib.find('\\') != std::string::npos ||
+                    std::filesystem::path(lib).has_extension()) args_.push_back(lib);
+                else args_.push_back("-l" + lib);
             }
 
             if (!cfg_.linker_script.empty()) {
@@ -486,10 +533,20 @@ class make_t {
          * @return @c 0x00 при успехе, @c 0x01 если @ref command_ пуста,
          *         @c 0x02 если команда завершилась с ошибкой.
          */
-        int run(const std::function<void(const std::string&)>& on_output = {}) {
+        int run(const std::function<void(const std::string&)>& on_output = {},
+                pgr_process::cancel_token* cancellation = nullptr,
+                const std::filesystem::path& directory = {}) {
             if (args_.empty()) {
                 std::cerr << "make_t: no command arguments (call build_args)\n";
                 return 0x01;
+            }
+            auto execute = [&](const std::vector<std::string>& arguments) {
+                pgr_process::options opt; opt.output=on_output; opt.cancel=cancellation;
+                opt.working_directory=directory; return pgr_process::run_ex(arguments,opt);
+            };
+            if (pgr_toolchain::classify(cfg_.compiler) == pgr_toolchain::family::msvc) {
+                const int rc=execute(args_);
+                return rc==0 ? 0x00 : 0x02;
             }
             // g++ treats .c as C++, so compile C translation units with gcc/clang
             // into independent objects, then let the C++ compiler link everything.
@@ -500,7 +557,8 @@ class make_t {
                 else has_cpp = true;
             }
             std::vector<std::string> link_args = args_;
-            const std::string cc = pgr_toolchain::c_compiler(cfg_.compiler);
+            const std::string cc = pgr_toolchain::c_compiler(
+                pgr_toolchain::selected_compiler(cfg_.compiler, cfg_.toolchain_prefix));
             if (!c_sources.empty() && (cc.empty() || !pgr_process::available(cc))) {
                 std::cerr << "make_t: matching C compiler not found: " << cc << '\n';
                 return 0x02;
@@ -534,7 +592,7 @@ class make_t {
                     for (const auto& path : cfg_.include_dirs) add("-I" + path);
                     cmd.insert(cmd.end(), {"-c", c_sources[i], "-o", obj.u8string()});
                     std::cout << "Executing: " << pgr_process::display(cmd) << '\n' << std::flush;
-                    if (pgr_process::run(cmd, false, on_output) != 0) return 0x02;
+                    if (execute(cmd) != 0) return 0x02;
                     objects.push_back(obj.u8string());
                 }
                 std::vector<std::string> updated;
@@ -550,7 +608,7 @@ class make_t {
                 link_args = std::move(updated);
             }
             std::cout << "Executing: " << pgr_process::display(link_args) << '\n' << std::flush;
-            const int rc = pgr_process::run(link_args, false, on_output);
+            const int rc = execute(link_args);
             if (rc != 0) {
                 std::cerr << "make_t: compiler failed, rc=" << rc << '\n';
                 return 0x02;
@@ -610,6 +668,13 @@ class make_t {
             if (!cfg_.c_standard.empty()) lines.push_back("c_standard=" + cfg_.c_standard);
             if (!cfg_.linker_script.empty()) lines.push_back("linker_script=" + cfg_.linker_script);
             if (!cfg_.target_type.empty()) lines.push_back("target_type=" + cfg_.target_type);
+            if (!cfg_.toolchain_prefix.empty()) lines.push_back("toolchain_prefix=" + cfg_.toolchain_prefix);
+            if (!cfg_.objcopy.empty()) lines.push_back("objcopy=" + cfg_.objcopy);
+            if (!cfg_.package_manager.empty()) lines.push_back("package_manager=" + cfg_.package_manager);
+            if (!cfg_.compiler_id.empty()) lines.push_back("compiler_id=" + cfg_.compiler_id);
+            if (!cfg_.cmake_id.empty()) lines.push_back("cmake_id=" + cfg_.cmake_id);
+            if (!cfg_.ninja_id.empty()) lines.push_back("ninja_id=" + cfg_.ninja_id);
+            if (!cfg_.objcopy_id.empty()) lines.push_back("objcopy_id=" + cfg_.objcopy_id);
 
             for (const auto& w : cfg_.warnings)
                 lines.push_back("warnings="       + w);
@@ -627,6 +692,8 @@ class make_t {
                 lines.push_back("libraries="      + s);
             for (const auto& p : cfg_.packages)
                 lines.push_back("packages=" + p);
+            for (const auto& p : cfg_.package_dirs)
+                lines.push_back("package_dirs=" + p);
 
             write_t w(path);
             if (w.status() != 0x00) return 0x03;
@@ -667,9 +734,11 @@ class make_t {
                     key == "warnings" || key == "sanitizers" || key == "lto" ||
                     key == "arch" || key == "specific_gcc" || key == "specific_clang" ||
                     key == "include_dirs" || key == "library_dirs" || key == "libraries" ||
-                    key == "profile" || key == "packages" || key == "toolchain_file" ||
+                    key == "profile" || key == "packages" || key == "package_dirs" || key == "toolchain_file" ||
                     key == "c_standard" || key == "linker_script" ||
-                    key == "target_type") recognized = true;
+                    key == "target_type" || key == "toolchain_prefix" ||
+                    key == "objcopy" || key == "package_manager" || key == "compiler_id" ||
+                    key == "cmake_id" || key == "ninja_id" || key == "objcopy_id") recognized = true;
 
                 if      (key == "compiler")       fresh.compiler      = val;
                 else if (key == "source_files")   fresh.source_files.push_back(val);
@@ -688,10 +757,18 @@ class make_t {
                 else if (key == "libraries")      fresh.libraries.push_back(val);
                 else if (key == "profile")  fresh.profile = val;
                 else if (key == "packages") fresh.packages.push_back(val);
+                else if (key == "package_dirs") fresh.package_dirs.push_back(val);
                 else if (key == "toolchain_file") fresh.toolchain_file = val;
                 else if (key == "c_standard") fresh.c_standard = val;
                 else if (key == "linker_script") fresh.linker_script = val;
                 else if (key == "target_type") fresh.target_type = val;
+                else if (key == "toolchain_prefix") fresh.toolchain_prefix = val;
+                else if (key == "objcopy") fresh.objcopy = val;
+                else if (key == "package_manager") fresh.package_manager = val;
+                else if (key == "compiler_id") fresh.compiler_id = val;
+                else if (key == "cmake_id") fresh.cmake_id = val;
+                else if (key == "ninja_id") fresh.ninja_id = val;
+                else if (key == "objcopy_id") fresh.objcopy_id = val;
             }
 
             if (in.bad()) return 0x05;

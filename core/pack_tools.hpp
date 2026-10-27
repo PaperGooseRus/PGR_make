@@ -7,6 +7,7 @@
 #include <system_error>
 #include "workspace.hpp"
 #include "process_runner.hpp"
+#include "toolchain.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -61,6 +62,7 @@ inline std::vector<fs::path> compilers(const fs::path& pack) {
                 filename == "clang" || filename == "clang++" ||
                 filename == "gcc.exe" || filename == "g++.exe" ||
                 filename == "clang.exe" || filename == "clang++.exe" ||
+                filename == "cl.exe" || filename == "cl" ||
                 filename.find("-gcc") != std::string::npos ||
                 filename.find("-g++") != std::string::npos;
             if (valid) binaries.push_back(it->path());
@@ -73,7 +75,8 @@ inline std::vector<fs::path> compilers(const fs::path& pack) {
 
 inline std::string version(const fs::path& executable) {
     std::string result;
-    pgr_process::run({pgr_workspace::utf8(executable), "--version"}, true,
+    pgr_process::run({pgr_workspace::utf8(executable),
+                       pgr_toolchain::classify(pgr_workspace::utf8(executable)) == pgr_toolchain::family::msvc ? "/Bv" : "--version"}, true,
         [&](const std::string& line) { if (result.empty()) result = line; });
     return result;
 }

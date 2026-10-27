@@ -39,7 +39,8 @@ inline bool safe_build_dir(const fs::path& target, const fs::path& source_root) 
         name == "cmake-build-debug" || name == "cmake-build-release" ||
         name.rfind("build-", 0) == 0 || name.rfind("build_", 0) == 0 ||
         name.rfind("build ", 0) == 0 ||
-        dest.parent_path().filename() == ".pgr_build";
+        dest.parent_path().filename() == ".pgr_build" ||
+        (within(dest, root / ".pgr_build") && dest != root / ".pgr_build");
     if (!designated) return false;
     // Never follow symlinks even when their resolved destination is inside the project.
     auto cursor = root;

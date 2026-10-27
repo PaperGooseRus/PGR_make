@@ -1,3 +1,29 @@
+## 0.4 — BuildController и GTK4 UX
+
+- Shared BuildController, explicit tool resolution, cancellable process tree, CLI/GUI parity.
+- Registry rename, relocate, clone, archive and offline display.
+- GUI quick-build selector, project/settings search, dirty guard, diagnostic filters and history.
+- Strict diagnostics JSON parser, isolated append-only history, MSVC-safe top-level CMake options.
+- New native and integration tests. Native GTK4 Windows execution remains unverified.
+
+## GTK4 GUI 0.2 — 2026-10-26
+
+- Горизонтальный GtkPaned: все настройки и команды слева, список проектов справа.
+- GTK4 GtkDropDown, множественные чекбоксы, многострочные списки путей и GtkFileDialog.
+- Новое поле package_dirs для CMAKE_PREFIX_PATH и выбора *Config.cmake.
+- Неинтерактивные CLI-действия --show-command, --generate-only, --clean-only, --export-commands.
+- Безопасный экспорт базы команд без перезаписи, отдельные сохранение/загрузка профилей.
+
+## GTK4 GUI 0.1
+
+- Отдельный `PGR_Make_GUI` на GTK4; сохранён исходный CLI/TUI.
+- Менеджер проектов, диалог создания проекта, выбор компилятора из Pack, настройка Debug/Release, три режима сборки.
+- Неблокирующее отображение журнала, диагностик, команда анализа clangd, открытие исходника в редакторе.
+- Общий модуль `core/project_setup.hpp` для регистрации и первичной настройки проекта.
+- Новый CLI-флаг `--direct` для вызова прямого backend без TUI.
+- Сборка GUI через CMake/pkg-config с проверкой доступности GTK4, Windows-скрипты и тест GUI/CLI контракта.
+- GUI 0.1 не является статическим GTK4 EXE; runtime GTK4 поставляется отдельно.
+
 # История изменений
 
 ## Исправления стабильности и безопасности (26 октября 2026)
@@ -32,3 +58,15 @@
 - Обновлены регрессионные тесты и документация.
 
 Тестирование: Linux GCC 14.2, CMake, Ninja; Windows-бинарник не собран в Linux-среде без кросс-компилятора.
+
+## 2026-10-26: toolchain abstraction and diagnostics
+
+- Added `core/diagnostics.hpp`, structured compiler/linker/clangd diagnostics, saved JSON, TUI browser and VS Code goto.
+- Added `core/analysis.hpp`: on-demand clangd check using compile_commands.json (not a persistent LSP client).
+- Added `core/presets.hpp` with isolated CMakePresets, vcpkg VCPKG_ROOT validation and opt-in Conan toolchain handling.
+- Added optional MSVC command-line backend and compiler family detection; expanded Pack `cl.exe` discovery.
+- Added cross compiler prefix, objcopy executable and optional ELF to BIN/HEX post-build in `core/artifacts.hpp`.
+- Added generated OBJECT targets and selected header-only INTERFACE targets; preserved prior static/shared defaults.
+- Added CLI options `--diagnostics`, `--analyze`, `--write-presets` and TUI commands 33-38.
+- Added CTest diagnostics parser, feature regression suite, architecture/status document.
+- Windows/MSVC native builds, Conan/vcpkg installations and live LSP sessions are not claimed as validated.

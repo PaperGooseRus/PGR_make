@@ -19,6 +19,10 @@
 
 #include "cmake_writer.hpp"
 #include "cmake_session.hpp"
+#include "presets.hpp"
+#include "analysis.hpp"
+#include "artifacts.hpp"
+#include "diagnostics.hpp"
 #include "pack_tools.hpp"
 #include "log_t.hpp"
 #include "make.hpp"
@@ -51,6 +55,7 @@ class tui_t {
         make_t builder_;
         flag_catalog_t catalog_;
         log_t log_;
+        pgr_diagnostics::collector diagnostics_;
         bool running_ = true;
         bool switch_project_ = false;
         pgr_workspace::project_t project_;
@@ -238,6 +243,12 @@ class tui_t {
             print_row(30, "Выбрать другой проект");
             print_row(31, "Компилятор из Pack");
             print_row(32, "Собрать исходный CMake-проект");
+            print_row(33, "Диагностика", std::to_string(diagnostics_.records().size()) + " записей");
+            print_row(34, "Анализ clangd (после CMake)");
+            print_row(35, "Создать CMakePresets.json");
+            print_row(36, "Префикс toolchain", disp(c.toolchain_prefix));
+            print_row(37, "Пакетный менеджер", disp(c.package_manager));
+            print_row(38, "Objcopy", disp(c.objcopy));
             print_row(0,  "Выход");
         }
 
@@ -741,9 +752,19 @@ class tui_t {
             }
 
             std::cout << '\n';
+            diagnostics_.clear();
             int rc = builder_.run([this](const std::string& line) {
                 log_.write("[gpp] " + line);
+                diagnostics_.add_line(line);
             });
+            diagnostics_.save(project_.store_root/"diagnostics.json");
+            if (rc==0) {
+                std::string error;
+                if (!pgr_artifacts::export_elf(project_,builder_.config(),error,
+                    [this](const std::string& line){ log_.write("[objcopy] "+line); })) {
+                    log_.error(error); rc=0x02;
+                }
+            }
             log_.write("[gpp] rc=" + std::to_string(rc));
 
             if (rc == 0x00) set_status("Сборка (g++): успех");
@@ -795,11 +816,13 @@ class tui_t {
                 if (ask_yesno("Использовать Ninja?", ninja) == input_result::ok && ninja)
                     configure.insert(configure.end(), {"-G", "Ninja"});
             }
-            if (builder_.config().toolchain_file.empty())
-                pgr_toolchain::cmake_compilers(builder_.config().compiler, configure);
-            else if (native)
-                configure.push_back("-DCMAKE_TOOLCHAIN_FILE=" + pgr_workspace::utf8(
-                    fs::absolute(fs::u8path(builder_.config().toolchain_file))));
+            pgr_toolchain::cmake_compilers(pgr_toolchain::selected_compiler(
+                builder_.config().compiler, builder_.config().toolchain_prefix), configure);
+            configure.push_back("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON");
+            std::string tool_error;
+            if (!pgr_presets::configure_toolchain(project_, builder_.config(), configure, tool_error)) {
+                set_status(tool_error,true); return;
+            }
             std::vector<std::string> build = {"cmake", "--build", pgr_workspace::utf8(target)};
             bool ok = false;
             if (ask_yesno("Выполнить configure и build?", ok)
@@ -811,16 +834,27 @@ class tui_t {
                 !pgr_cmake::prepare_cache(project_, target, builder_.config(), error, native)) {
                 log_.error("[cmake] " + error); set_status(error, true); wait_enter(); return;
             }
+            diagnostics_.clear();
             log_.write("[cmake] configure: " + pgr_process::display(configure));
             int rc = pgr_process::run(configure, false, [this](const std::string& line) {
                 log_.write("[cmake configure] " + line);
+                diagnostics_.add_line(line);
             });
             if (rc == 0) {
                 log_.write("[cmake] build: " + pgr_process::display(build));
                 rc = pgr_process::run(build, false, [this](const std::string& line) {
                     log_.write("[cmake build] " + line);
+                    diagnostics_.add_line(line);
                 });
             }
+            if (rc==0 && !native) {
+                std::string error;
+                if (!pgr_artifacts::export_elf(project_,builder_.config(),error,
+                    [this](const std::string& line){ log_.write("[objcopy] "+line); })) {
+                    log_.error(error); rc=2;
+                }
+            }
+            diagnostics_.save(project_.store_root/"diagnostics.json");
             set_status(rc == 0 ? "CMake: успех" : "CMake: ошибка rc=" + std::to_string(rc), rc != 0);
             wait_enter();
         }
@@ -964,7 +998,7 @@ class tui_t {
             std::string value;
             const std::string prompt = item == 26 ? "Путь к toolchain.cmake: " :
                 item == 27 ? "Стандарт C (-std=c11): " :
-                item == 28 ? "Путь к linker.ld: " : "Библиотеки (static/shared): ";
+                item == 28 ? "Путь к linker.ld: " : "Тип библиотек (static/shared/object/interface): ";
             if (ask_line(prompt, value, true) != input_result::ok) return;
             auto assign = [&](const std::string& v) {
                 switch (item) {
@@ -988,6 +1022,56 @@ class tui_t {
         // Диспетчер
         // ------------------------------------------------------------------
 
+        void do_diagnostics() {
+            diagnostics_.print();
+            if (diagnostics_.records().empty()) {
+                std::cout << "Файл: " << pgr_workspace::utf8(project_.store_root/"diagnostics.json") << '\n';
+                wait_enter(); return;
+            }
+            int index=0;
+            if (ask_int("Номер ошибки для открытия в VS Code (0 = назад): ",
+                        0,static_cast<int>(diagnostics_.records().size()),index) != input_result::ok || !index) return;
+            const auto& d=diagnostics_.records()[static_cast<size_t>(index-1)];
+            if (d.file.empty() || d.line <= 0) { set_status("Нет позиции исходника",true); return; }
+            fs::path path=fs::u8path(d.file);
+            if (path.is_relative()) path=project_.source_root/path;
+            if (!fs::is_regular_file(path)) { set_status("Файл недоступен",true); return; }
+            if (!pgr_process::available("code")) { set_status("VS Code (code) не найден; " + pgr_workspace::utf8(path),true); return; }
+            bool open=false;
+            if (ask_yesno("Открыть выбранную позицию во внешнем VS Code?",open) != input_result::ok || !open) return;
+            const std::string goto_line=pgr_workspace::utf8(path)+":"+std::to_string(d.line)+":"+std::to_string(std::max(d.column,1));
+            if (pgr_process::run({"code","--goto",goto_line}) != 0) set_status("Не удалось открыть редактор",true);
+        }
+        void do_analysis() {
+            diagnostics_.clear();
+            int rc=pgr_analysis::clangd_check(project_, diagnostics_, [this](const std::string& line){
+                log_.write("[clangd] " + line);
+            });
+            diagnostics_.print();
+            set_status(rc==0 ? "clangd: проверка завершена" : "clangd: есть ошибки или нет базы компиляции",rc!=0);
+            wait_enter();
+        }
+        void do_presets() {
+            std::string error;
+            if (!pgr_cmake::generate(project_,builder_.config(),error) ||
+                !pgr_presets::write(project_,builder_.config(),error)) {
+                set_status(error,true); return;
+            }
+            set_status("Presets: " + pgr_workspace::utf8(project_.stage()/"CMakePresets.json"));
+        }
+        void do_extra(int choice) {
+            const char* prompt=choice==36 ? "Префикс (arm-none-eabi-): " :
+                choice==37 ? "Пакетный менеджер (none/vcpkg/conan): " : "Путь objcopy: ";
+            std::string value;
+            if (ask_line(prompt,value,true)!=input_result::ok) return;
+            if (choice==37 && !value.empty() && value!="none" && value!="vcpkg" && value!="conan") {
+                set_status("Ожидается none/vcpkg/conan",true); return;
+            }
+            if (choice==36) builder_.set_toolchain_prefix(value);
+            if (choice==37) builder_.set_package_manager(value);
+            if (choice==38) builder_.set_objcopy(value);
+            set_status("Настройка обновлена");
+        }
         static std::string choice_name(int choice) {
             switch (choice) {
                 case 1:  return "compiler";
@@ -1017,6 +1101,12 @@ class tui_t {
                 case 25: return "copy_compile_commands";
                 case 31: return "pack_compiler";
                 case 32: return "native_cmake";
+                case 33: return "diagnostics";
+                case 34: return "clangd_check";
+                case 35: return "cmake_presets";
+                case 36: return "toolchain_prefix";
+                case 37: return "package_manager";
+                case 38: return "objcopy";
                 case 0:  return "exit";
                 default: return "unknown";
             }
@@ -1056,6 +1146,10 @@ class tui_t {
                 case 30: running_ = false; switch_project_ = true; break;
                 case 31: do_pack_compiler(); break;
                 case 32: do_build_cmake(true); break;
+                case 33: do_diagnostics(); break;
+                case 34: do_analysis(); break;
+                case 35: do_presets(); break;
+                case 36: case 37: case 38: do_extra(choice); break;
                 case 0:  running_ = false;           break;
                 default: set_status("Нет такого пункта", true); break;
             }
@@ -1085,6 +1179,7 @@ class tui_t {
                           << " — работаю без логирования\n";
             }
             log_.write("=== Session started ===");
+            diagnostics_.load(project_.store_root/"diagnostics.json");
 
             if (catalog_.load_builtin() != 0x00) {
                 std::cerr << "Не удалось загрузить встроенные флаги\n";
@@ -1118,7 +1213,7 @@ class tui_t {
                 print_menu();
 
                 int choice = -1;
-                auto r = ask_int("Выбор: ", 0, 32, choice);
+                auto r = ask_int("Выбор: ", 0, 38, choice);
                 if (r == input_result::eof) {
                     log_.write("[menu] EOF");
                     break;

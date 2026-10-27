@@ -1,17 +1,22 @@
-# PGR_Make — проверка исправленной версии
+# PGR_Make — проверка расширенной версии
 
 Дата: 26.10.2026.
 
-Выполнена чистая конфигурация и сборка исходников:
+Проверено в Linux, GCC 14.2, CMake 3.31, Ninja, clangd 17.0.
+
+Команды:
 
 ```sh
-cmake -S PGR_make -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-python3 PGR_make/tests/run_tests.py build/PGR_Make
+cmake -S . -B build-review -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-review
+ctest --test-dir build-review --output-on-failure
+python3 tests/run_tests.py build-review/PGR_Make
+python3 tests/run_features.py build-review/PGR_Make
 ```
 
-Итог: 32 регрессионных сценария PASS на Linux/GCC 14.2 (CMake + Ninja).
+- Пройдены **32 исходных регрессионных сценария**.
+- Пройден **модульный тест парсера** (GCC, MSVC C2065/LNK2019, clangd, warning -Wcode, cross prefix).
+- Пройдены **14 новых функциональных сценариев** (CMakePresets, Conan/vcpkg config validation, успешный/ошибочный JSON, линковщик, OBJECT, cross-prefix/objcopy ELF/BIN/HEX, аргументы MSVC через имитатор, clangd-диагностика защита BIN и восстановление записей TUI).
+- Проверен отказ от небезопасной очистки и сохранность пользовательских файлов в исходном наборе.
 
-В числе новых проверок: отказ от удаления чужого `build_user`, запрет удаления каталога сборки другого проекта, работа двух конфигураций в одной папке, сборка смешанного C/C++, автоматическая смена компилятора в CMakeCache, сохранность пользовательского `compile_commands.json`, сборка существующего CMakeLists.txt, автоматическое обновление CMake в TUI, выбор компилятора из Pack и обнаружение вложенного C-проекта.
-
-**Ограничения проверки**: Windows EXE не собран; Windows Unicode CLI и статическая линковка предусмотрены в коде, но требуют тестирования в MSYS2 UCRT64 на Windows. Embedded GCC/Clang и прошивка микроконтроллеров не тестировались. Отсутствующие функции управления реестром (переименование/удаление), прямой инкрементальной сборки и прошивки MCU здесь не добавлялись.
+**Ограничения:** готовый Windows EXE, реальный компилятор MSVC, реальные ARM/RISC-V и установленный Conan/vcpkg здесь не проверены. Тест cross-prefix использует имитаторы имён компиляторов, перенаправляющие команды на системный GCC. Генерация BIN/HEX проверена при помощи системного `objcopy`. `clangd --check` реализован как одноразовый анализ, полноценный LSP-сервер/клиент не реализован.

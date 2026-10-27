@@ -23,6 +23,10 @@
 
 #include "core/TUI.hpp"
 #include "core/cmake_writer.hpp"
+#include "core/diagnostics.hpp"
+#include "core/analysis.hpp"
+#include "core/presets.hpp"
+#include "core/artifacts.hpp"
 #include "core/make.hpp"
 #include "core/pack_tools.hpp"
 #include "core/process_runner.hpp"
@@ -31,133 +35,37 @@
 #include "core/toolchain.hpp"
 #include "core/cmake_session.hpp"
 #include "core/workspace.hpp"
+#include "core/project_setup.hpp"
+#include "core/build_controller.hpp"
+#include "core/pack_manager.hpp"
 
 namespace fs = std::filesystem;
 using pgr_workspace::project_t;
 using pgr_workspace::registry_t;
 
-static bool configure_new(const project_t& project, std::string& error) {
-    make_t builder;
-    builder.set_compiler("g++");
-    builder.set_standard("-std=c++17");
-    builder.set_optimization("-O0");
-    builder.set_warnings({"-Wall", "-Wextra"});
-    const auto sources = pgr_workspace::discover_sources(project.source_root);
-    builder.set_source_files(sources);
-    const bool cpp = std::any_of(sources.begin(), sources.end(), [](const std::string& file) {
-        return fs::u8path(file).extension() != ".c";
-    });
-    if (!cpp && !sources.empty()) { builder.set_compiler("gcc"); builder.set_c_standard("-std=c11"); }
-    builder.set_output_file("build/" + project.name +
-#ifdef _WIN32
-        ".exe"
-#else
-        ""
-#endif
-    );
-    if (builder.save(pgr_workspace::utf8(project.config())) != 0) {
-        error = "Cannot save project configuration";
-        return false;
-    }
-    return true;
-}
-
-static bool create_project(const registry_t& registry, const std::string& name,
-                           const fs::path& source, bool starter, project_t& result,
-                           std::string& error) {
-    if (!registry.create(name, source, result, error)) return false;
-    if (starter && !fs::exists(result.source_root / "main.cpp") &&
-        !fs::exists(result.source_root / "src/main.cpp")) {
-        std::ofstream example(result.source_root / "main.cpp", std::ios::binary);
-        example << "#include <iostream>\n\nint main() {\n"
-                   "    std::cout << \"Hello from PGR_Make!\\n\";\n"
-                   "    return 0;\n}\n";
-        example.close();
-        if (!example) { error = "Cannot write sample main.cpp"; return false; }
-    }
-    return configure_new(result, error);
-}
-
-static int run_ci(const project_t& project, const std::string& profile,
-                  const std::string& build_dir, bool clean, bool native_cmake) {
-    make_t builder;
-    fs::path config = project.config();
-    if (!profile.empty()) {
-        if (!pgr_workspace::valid_name(profile)) {
-            std::cerr << "CI: invalid profile name\n";
-            return 1;
-        }
-        config = project.profiles() / fs::u8path(profile + ".cfg");
-    }
-    if (builder.load(pgr_workspace::utf8(config)) != 0) {
-        std::cerr << "CI: cannot load config " << pgr_workspace::utf8(config) << '\n';
-        return 1;
-    }
-    if (builder.validate_configuration() != 0) {
-        std::cerr << "CI: invalid configuration\n";
-        return 1;
-    }
-    const fs::path target = build_dir.empty() ? project.build() : pgr_paths::absolute_build_dir(fs::u8path(build_dir), project.source_root);
-    if (!pgr_paths::safe_build_dir(target, project.source_root)) {
-        std::cerr << "CI: unsafe build directory: " << build_dir << '\n';
-        return 1;
-    }
-    if (clean) {
-        std::string error;
-        if (!pgr_paths::clean(target, project.source_root, project.store_root, error)) {
-            std::cerr << "CI clean: " << error << '\n';
-            return 1;
-        }
-    }
-
-    std::string prep_error;
-    if (!pgr_paths::prepare(target, project.source_root, project.store_root, prep_error)) {
-        std::cerr << "CI: " << prep_error << '\n'; return 1;
-    }
-    if (native_cmake && !fs::is_regular_file(project.source_root / "CMakeLists.txt")) {
-        std::cerr << "CI: no existing CMakeLists.txt in source root\n"; return 1;
-    }
-    if (!native_cmake && !pgr_cmake::generate(project, builder.config(), prep_error)) {
-        std::cerr << "CI: " << prep_error << '\n'; return 1;
-    }
-    if (!pgr_cmake::prepare_cache(project, target, builder.config(), prep_error, native_cmake)) {
-        std::cerr << "CI: " << prep_error << '\n'; return 1;
-    }
-
-    std::vector<std::string> configure = {
-        "cmake", "-S", pgr_workspace::utf8(native_cmake ? project.source_root : project.stage()), "-B", pgr_workspace::utf8(target)
-    };
-    if (!fs::exists(target / "CMakeCache.txt") && pgr_process::available("ninja")) {
-        configure.push_back("-G");
-        configure.push_back("Ninja");
-    }
-    // Toolchain-file handling is generated before project() by cmake_writer.
-    if (builder.config().toolchain_file.empty())
-        pgr_toolchain::cmake_compilers(builder.config().compiler, configure);
-    else if (native_cmake)
-        configure.push_back("-DCMAKE_TOOLCHAIN_FILE=" + pgr_workspace::utf8(
-            fs::absolute(fs::u8path(builder.config().toolchain_file))));
-    auto build = std::vector<std::string>{"cmake", "--build", pgr_workspace::utf8(target)};
-    std::cout << "CI: " << pgr_process::display(configure) << '\n' << std::flush;
-    if (pgr_process::run(configure) != 0) return 2;
-    std::cout << "CI: " << pgr_process::display(build) << '\n' << std::flush;
-    if (pgr_process::run(build) != 0) return 3;
-    std::error_code ec;
-    const auto commands = target / "compile_commands.json";
-    if (fs::exists(commands)) {
-        fs::copy_file(commands, project.store_root / "compile_commands.json",
-            fs::copy_options::overwrite_existing, ec);
-        if (ec) std::cerr << "CI: warning: compile_commands: " << ec.message() << '\n';
-    }
-    return 0;
-}
-
 static void print_help(const char* argv0) {
     std::cout << "Usage: " << argv0 << " [options]\n"
               << "  (no args)                 Select/create project in TUI\n"
               << "  --list                    Show registered projects\n"
-              << "  --toolchains              Show compilers found in Pack\n"
+              << "  --toolchains              Show compilers found in Pack (GCC/Clang/MSVC)\n"
+              << "  --pack-list               List registered installed tool versions\n"
+              << "  --pack-catalog            List available vetted packages\n"
+              << "  --pack-install ID         Install catalog package from HTTPS (SHA-256 required)\n"
+              << "  --pack-import ID ZIP      Install catalog package from local ZIP\n"
+              << "  --pack-import-custom ID ZIP SHA256 EXE  Import a verified ZIP outside catalog\n"
+              << "  --pack-register ID DIR EXE Register external tool installation\n"
+              << "  --pack-bind SLOT ID       Bind project to compiler/cmake/ninja/objcopy version\n"
+              << "  --pack-unbind SLOT        Remove project's version pin\n"
+              << "  --pack-retire ID          Unregister and quarantine unused version\n"
+              << "  --diagnostics             Print last structured diagnostics JSON\n"
+              << "  --analyze                 Run clangd --check (after CMake build)\n"
+              << "  --write-presets           Generate isolated CMakePresets.json\n"
+              << "  --generate-only           Generate CMake without building\n"
+              << "  --clean-only              Clean owned build directory without rebuilding\n"
+              << "  --show-command            Show direct compile command\n"
+              << "  --export-commands         Export compile_commands.json from owned build\n"
               << "  --native-cmake            Use existing project CMakeLists.txt (with --ci)\n"
+              << "  --direct                  Direct compiler build (with --ci)\n"
               << "  --create NAME --source-dir DIR [--starter]\n"
               << "                            Create project entry; optionally starter main.cpp\n"
               << "  --project NAME            Open selected project TUI\n"
@@ -192,7 +100,7 @@ static bool select_project(const registry_t& registry, project_t& selected) {
             std::cout << "Создать пример main.cpp, если его нет? [y/N]: ";
             std::string answer;
             if (!std::getline(std::cin, answer)) return false;
-            if (create_project(registry, name, pgr_workspace::from_utf8(directory),
+            if (pgr_project::create_project(registry, name, pgr_workspace::from_utf8(directory),
                                answer == "y" || answer == "Y" || answer == "д" || answer == "Д", selected, error)) {
                 std::cout << "Проект создан: " << selected.name << '\n';
                 return true;
@@ -214,6 +122,8 @@ static bool select_project(const registry_t& registry, project_t& selected) {
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
+    (void)argc;
+    (void)argv;
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
@@ -231,7 +141,12 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < argc; ++i) cli_args.emplace_back(argv[i]);
 #endif
     bool ci = false, clean = false, list = false, starter = false, toolchains = false, native_cmake = false;
+    bool analyze = false, diagnostics = false, write_presets = false, direct = false;
+    bool generate_only = false, clean_only = false, show_command = false, export_commands = false;
     std::string project_name, create_name, profile, build_dir;
+    std::string pack_action, pack_id, pack_slot, pack_value;
+    fs::path pack_archive, pack_root;
+    std::string pack_exe;
     fs::path source_dir, home = pgr_workspace::executable_directory();
     for (std::size_t i = 1; i < cli_args.size(); ++i) {
         const std::string a = cli_args[i];
@@ -240,7 +155,35 @@ int main(int argc, char* argv[]) {
         else if (a == "--clean") clean = true;
         else if (a == "--list") list = true;
         else if (a == "--toolchains") toolchains = true;
+        else if (a == "--pack-list" || a == "--pack-catalog") pack_action=a;
+        else if ((a == "--pack-install" || a == "--pack-retire") && i+1<cli_args.size()) {
+            pack_action=a;pack_id=cli_args[++i];
+        }
+        else if (a=="--pack-import" && i+2<cli_args.size()) {
+            pack_action=a;pack_id=cli_args[++i];pack_archive=pgr_workspace::from_utf8(cli_args[++i]);
+        }
+        else if (a=="--pack-import-custom" && i+4<cli_args.size()) {
+            pack_action=a;pack_id=cli_args[++i];pack_archive=pgr_workspace::from_utf8(cli_args[++i]);
+            pack_value=cli_args[++i];pack_exe=cli_args[++i];
+        }
+        else if (a=="--pack-register" && i+3<cli_args.size()) {
+            pack_action=a;pack_id=cli_args[++i];pack_root=pgr_workspace::from_utf8(cli_args[++i]);pack_exe=cli_args[++i];
+        }
+        else if (a=="--pack-bind" && i+2<cli_args.size()) {
+            pack_action=a;pack_slot=cli_args[++i];pack_value=cli_args[++i];
+        }
+        else if (a=="--pack-unbind" && i+1<cli_args.size()) {
+            pack_action=a;pack_slot=cli_args[++i];
+        }
+        else if (a == "--analyze") analyze = true;
+        else if (a == "--diagnostics") diagnostics = true;
+        else if (a == "--write-presets") write_presets = true;
+        else if (a == "--generate-only") generate_only = true;
+        else if (a == "--clean-only") clean_only = true;
+        else if (a == "--show-command") show_command = true;
+        else if (a == "--export-commands") export_commands = true;
         else if (a == "--native-cmake") native_cmake = true;
+        else if (a == "--direct") direct = true;
         else if (a == "--starter") starter = true;
         else if ((a == "--project" || a == "--create" || a == "--source-dir" ||
                   a == "--profile" || a == "--build-dir" || a == "--home") && i + 1 < cli_args.size()) {
@@ -253,8 +196,21 @@ int main(int argc, char* argv[]) {
             else home = pgr_workspace::from_utf8(value);
         } else { std::cerr << "Unknown or incomplete argument: " << a << '\n'; return 1; }
     }
+    if(!pack_action.empty() && (ci || analyze || diagnostics || write_presets || generate_only || clean_only || show_command || export_commands ||
+                                !create_name.empty() || list || toolchains)) {
+        std::cerr << "Pack command cannot be combined with build command\n"; return 1;
+    }
+    if (direct && (!ci || native_cmake || clean)) {
+        std::cerr << "--direct requires --ci and cannot be combined with --native-cmake or --clean\n";
+        return 1;
+    }
     if (clean && !ci) { std::cerr << "--clean requires --ci\n"; return 1; }
-    if (ci && project_name.empty()) { std::cerr << "--ci requires --project NAME\n"; return 1; }
+    if ((ci || analyze || diagnostics || write_presets || generate_only || clean_only || show_command || export_commands) && project_name.empty()) {
+        std::cerr << "Project action requires --project NAME\n"; return 1;
+    }
+    if ((static_cast<int>(ci)+analyze+diagnostics+write_presets+generate_only+clean_only+show_command+export_commands)>1) {
+        std::cerr << "Choose one project action per invocation\n"; return 1;
+    }
     if ((!create_name.empty() && (source_dir.empty() || ci)) ||
         (create_name.empty() && (!source_dir.empty() || starter))) {
         std::cerr << "--create NAME requires --source-dir DIR; --starter only with --create\n";
@@ -264,8 +220,104 @@ int main(int argc, char* argv[]) {
     registry_t registry(home);
     std::string error;
     if (!registry.ensure(error)) { std::cerr << "Workspace: " << error << '\n'; return 1; }
-    pgr_pack::activate(registry.pack_root());
+    // Legacy TUI and utility modes still use PATH-based discovery.
+    // CI uses explicit per-project tools from BuildController instead.
+    if (!ci && pack_action.empty()) pgr_pack::activate(registry.pack_root());
 
+    if (!pack_action.empty()) {
+        pgr_pack_manager::manager manager(registry.pack_root(),registry.root());
+        if(!manager.load(error)) {std::cerr<<"Pack: "<<error<<'\n';return 1;}
+        if(pack_action=="--pack-list") {
+            for(const auto& x:manager.entries()) {
+                std::string diagnostic;
+                const bool ok=pgr_pack_manager::verify_tool(x,diagnostic);
+                std::cout<<x.id<<'\t'<<(ok?"ready":"invalid")<<'\t'<<pgr_workspace::utf8(pgr_pack_manager::executable_path(x))<<'\n';
+            }
+            return 0;
+        }
+        const auto catalog_path=manager.catalog_file();
+        auto list=pgr_pack_manager::catalog(catalog_path,error);
+        if(pack_action=="--pack-catalog") {
+            if(!error.empty()) {std::cerr<<error<<'\n';return 1;}
+            for(const auto& x:list) std::cout<<x.id<<'\t'<<x.url<<'\n';
+            return 0;
+        }
+        auto bind=[&](bool unbind)->int {
+            if(project_name.empty()) {std::cerr<<"--pack-bind requires --project NAME\n";return 1;}
+            if(pack_slot!="compiler" && pack_slot!="cmake" && pack_slot!="ninja" && pack_slot!="objcopy") {
+                std::cerr<<"Unsupported pin slot\n";return 1;
+            }
+            pgr_workspace::project_t p;
+            if(!registry.read(project_name,p,error)) {std::cerr<<error<<'\n';return 1;}
+            make_t config;
+            if(config.load(pgr_workspace::utf8(p.config()))!=0) return 1;
+            if(!unbind) {
+                const auto* entry=manager.find(pack_value);
+                if(!entry || (pack_slot=="compiler"?!(entry->tool=="gcc"||entry->tool=="clang"||entry->tool=="msvc"):entry->tool!=pack_slot) ||
+                   !pgr_pack_manager::verify_tool(*entry,error)) {std::cerr<<"Cannot bind: "<<error<<'\n';return 1;}
+                if(pack_slot=="compiler")config.set_compiler(pgr_workspace::utf8(pgr_pack_manager::executable_path(*entry)));
+            }
+            const auto& c=config.config();
+            if(unbind && pack_slot=="compiler" && !c.compiler_id.empty()) {
+                // Otherwise an unbound project keeps pointing to a retired absolute path.
+                const auto file=fs::u8path(c.compiler).filename().u8string();
+                if(file=="g++"||file=="g++.exe"||file=="clang++"||file=="clang++.exe"||file=="cl.exe"||file=="cl")
+                    config.set_compiler(file);
+            }
+            const std::string value=unbind?"":pack_value;
+            config.set_pins(pack_slot=="compiler"?value:c.compiler_id,pack_slot=="cmake"?value:c.cmake_id,
+                            pack_slot=="ninja"?value:c.ninja_id,pack_slot=="objcopy"?value:c.objcopy_id);
+            if(config.save(pgr_workspace::utf8(p.config()))!=0) return 1;
+            std::cout<<"Pin updated: "<<pack_slot<<" = "<<value<<'\n';return 0;
+        };
+        if(pack_action=="--pack-bind"||pack_action=="--pack-unbind")return bind(pack_action=="--pack-unbind");
+        if(pack_action=="--pack-retire") {
+            std::vector<std::string> references;
+            for(const auto& entry:registry.entries()) {
+                // Include projects whose source drive is currently disconnected.
+                const fs::path store=registry.projects_root()/pgr_workspace::from_utf8(entry.name);
+                std::vector<fs::path> profiles={store/"config.cfg"};
+                std::error_code ec;
+                for(fs::directory_iterator it(store/"profiles",fs::directory_options::skip_permission_denied,ec),end;
+                    !ec && it!=end;it.increment(ec)) if(it->is_regular_file()&&it->path().extension()==".cfg") profiles.push_back(it->path());
+                for(const auto& path:profiles) {
+                    make_t cfg;if(cfg.load(pgr_workspace::utf8(path))!=0)continue;
+                    const auto& c=cfg.config();
+                    for(const auto& id:{c.compiler_id,c.cmake_id,c.ninja_id,c.objcopy_id})if(!id.empty())references.push_back(id);
+                }
+            }
+            if(!manager.remove(pack_id,references,error)){std::cerr<<"Retire: "<<error<<'\n';return 1;}
+            std::cout<<"Retired tool metadata; managed installation moved to Pack/Retired\n";return 0;
+        }
+        if(pack_action=="--pack-register") {
+            // Format tool@version@platform is the identity of an externally installed bundle.
+            const auto first=pack_id.find('@'),second=pack_id.find('@',first==std::string::npos?0:first+1);
+            if(first==std::string::npos||second==std::string::npos) {std::cerr<<"Expected TOOL@VERSION@PLATFORM\n";return 1;}
+            pgr_pack_manager::installed x;
+            x.id=pack_id;x.tool=pack_id.substr(0,first);x.version=pack_id.substr(first+1,second-first-1);
+            x.platform=pack_id.substr(second+1);x.root=fs::absolute(pack_root);
+            x.executable=pack_exe;
+            if(x.platform!=pgr_pack_manager::platform()||!manager.register_external(x,error)) {
+                std::cerr<<"Register: "<<error<<'\n';return 1;
+            }
+            std::cout<<"Registered "<<x.id<<'\n';return 0;
+        }
+        if(pack_action=="--pack-import-custom") {
+            const auto first=pack_id.find('@'),second=pack_id.find('@',first==std::string::npos?0:first+1);
+            if(first==std::string::npos||second==std::string::npos) {std::cerr<<"Expected TOOL@VERSION@PLATFORM\n";return 1;}
+            pgr_pack_manager::package item;
+            item.id=pack_id;item.tool=pack_id.substr(0,first);item.version=pack_id.substr(first+1,second-first-1);
+            item.platform=pack_id.substr(second+1);item.sha256=pack_value;item.executable=pack_exe;
+            if(!manager.install(item,pack_archive,error)){std::cerr<<"Import: "<<error<<'\n';return 1;}
+            std::cout<<"Imported "<<item.id<<'\n';return 0;
+        }
+        if(!error.empty()) {std::cerr<<error<<'\n';return 1;}
+        auto it=std::find_if(list.begin(),list.end(),[&](const auto& x){return x.id==pack_id;});
+        if(it==list.end()) {std::cerr<<"Unknown catalog package: "<<pack_id<<'\n';return 1;}
+        const fs::path archive=pack_action=="--pack-import"?pack_archive:fs::path{};
+        if(!manager.install(*it,archive,error)) {std::cerr<<"Install: "<<error<<'\n';return 1;}
+        std::cout<<"Installed "<<pack_id<<'\n';return 0;
+    }
     if (toolchains) {
         for (const auto& path : pgr_pack::compilers(registry.pack_root()))
             std::cout << pgr_workspace::utf8(path) << "\t" << pgr_pack::version(path) << '\n';
@@ -278,7 +330,7 @@ int main(int argc, char* argv[]) {
     }
     if (!create_name.empty()) {
         project_t created;
-        if (!create_project(registry, create_name, source_dir, starter, created, error)) {
+        if (!pgr_project::create_project(registry, create_name, source_dir, starter, created, error)) {
             std::cerr << "Create: " << error << '\n'; return 1;
         }
         std::cout << "Registered " << created.name << " -> " << pgr_workspace::utf8(created.source_root)
@@ -295,7 +347,84 @@ int main(int argc, char* argv[]) {
         std::error_code ec;
         fs::current_path(selected.source_root, ec);
         if (ec) { std::cerr << "Cannot access project: " << ec.message() << '\n'; return 1; }
-        if (ci) return run_ci(selected, profile, build_dir, clean, native_cmake);
+        if (generate_only) {
+            make_t config;
+            if (config.load(pgr_workspace::utf8(selected.config())) != 0) return 1;
+            if (!pgr_cmake::generate(selected, config.config(), error)) {
+                std::cerr << "Generate: " << error << '\n'; return 1;
+            }
+            std::cout << "Generated " << pgr_workspace::utf8(selected.stage()) << '\n';
+            return 0;
+        }
+        if (clean_only) {
+            make_t settings;
+            if(settings.load(pgr_workspace::utf8(selected.config()))!=0) return 1;
+            const auto target = build_dir.empty() ? pgr_build::default_build_directory(selected,settings.config()) :
+                pgr_paths::absolute_build_dir(fs::u8path(build_dir), selected.source_root);
+            if (!pgr_paths::clean(target, selected.source_root, selected.store_root, error)) {
+                std::cerr << "Clean: " << error << '\n'; return 1;
+            }
+            std::cout << "Cleaned " << pgr_workspace::utf8(target) << '\n'; return 0;
+        }
+        if (export_commands) {
+            make_t settings;
+            if(settings.load(pgr_workspace::utf8(selected.config()))!=0) return 1;
+            const auto target = build_dir.empty() ? pgr_build::default_build_directory(selected,settings.config()) :
+                pgr_paths::absolute_build_dir(fs::u8path(build_dir), selected.source_root);
+            if (!pgr_paths::safe_build_dir(target, selected.source_root)) {
+                std::cerr << "Export: unsafe build directory\n"; return 1;
+            }
+            const auto source = target / "compile_commands.json";
+            const auto destination = selected.source_root / "compile_commands.json";
+            if (!fs::is_regular_file(source)) {
+                std::cerr << "Export: run a CMake build first\n"; return 1;
+            }
+            if (fs::exists(destination)) {
+                std::cerr << "Export: refusing to overwrite existing " << pgr_workspace::utf8(destination) << '\n';
+                return 1;
+            }
+            std::error_code ec_copy;
+            fs::copy_file(source, destination, fs::copy_options::none, ec_copy);
+            if (ec_copy) { std::cerr << "Export: " << ec_copy.message() << '\n'; return 1; }
+            std::cout << "Exported to " << pgr_workspace::utf8(destination) << '\n';
+            return 0;
+        }
+        if (show_command) {
+            make_t config;
+            if (config.load(pgr_workspace::utf8(selected.config())) != 0 ||
+                config.build_args() != 0) {
+                std::cerr << "Command: cannot prepare direct command\n"; return 1;
+            }
+            std::cout << pgr_process::display(config.args()) << '\n'; return 0;
+        }
+        if (ci) {
+            pgr_build::options params;
+            params.profile=profile; params.build_dir=build_dir;
+            params.clean=clean; params.native_cmake=native_cmake; params.direct=direct;
+            params.pack=registry.pack_root();
+            return pgr_build::run(selected,params);
+        }
+        if (diagnostics) {
+            std::ifstream f(selected.store_root/"diagnostics.json", std::ios::binary);
+            if (!f) { std::cerr << "No diagnostics report yet\n"; return 1; }
+            std::cout << f.rdbuf(); return 0;
+        }
+        if (analyze) {
+            pgr_diagnostics::collector found;
+            const int rc=pgr_analysis::clangd_check(selected,found,
+                [](const std::string& l){ std::cout << l << '\n'; });
+            found.print(); return rc;
+        }
+        if (write_presets) {
+            make_t cfg;
+            if (cfg.load(pgr_workspace::utf8(selected.config())) != 0) return 1;
+            if (!pgr_cmake::generate(selected,cfg.config(),error) ||
+                !pgr_presets::write(selected,cfg.config(),error)) {
+                std::cerr << "Presets: " << error << '\n'; return 1;
+            }
+            std::cout << "Created " << pgr_workspace::utf8(selected.stage()/"CMakePresets.json") << '\n';
+            return 0;
+        }
         tui_t tui(selected);
         const bool switch_project = tui.run();
         if (!switch_project) return 0;

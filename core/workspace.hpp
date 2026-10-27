@@ -41,7 +41,7 @@ inline fs::path executable_directory() {
 
 inline bool valid_name(const std::string& name) {
     if (name.empty() || name.size() > 128 || name == "." || name == "..") return false;
-    if (name.front() == ' ' || name.back() == '.' || name.back() == ' ') return false;
+    if (name.front() == ' ' || name.front() == '.' || name.back() == '.' || name.back() == ' ') return false;
     // UTF-8 letters are accepted; forbid Windows separators/reserved characters.
     for (unsigned char c : name)
         if (c < 32 || c == 127 || c == '<' || c == '>' || c == ':' || c == '"' ||
@@ -146,12 +146,143 @@ public:
         return true;
     }
 
+    struct entry_t {
+        std::string name;
+        fs::path source;
+        bool available = false;
+        std::string problem;
+    };
+    std::vector<entry_t> entries() const {
+        std::vector<entry_t> found;
+        std::error_code ec;
+        for (fs::directory_iterator it(projects_root(), fs::directory_options::skip_permission_denied, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            if (!it->is_directory() || it->is_symlink()) continue;
+            const std::string name = utf8(it->path().filename());
+            if (!valid_name(name) || name.front()=='.') continue;
+            project_t p;
+            std::string problem;
+            bool available = read(name,p,problem);
+            fs::path source = available ? p.source_root : fs::path{};
+            if (!available) {
+                std::ifstream meta(it->path()/"project.pgr", std::ios::binary);
+                std::string line;
+                while (std::getline(meta,line))
+                    if (line.rfind("source=",0)==0) { source=from_utf8(line.substr(7)); break; }
+            }
+            found.push_back({name,source,available,problem});
+        }
+        std::sort(found.begin(),found.end(),[](const entry_t&a,const entry_t&b){return a.name<b.name;});
+        return found;
+    }
+
+    // These operations mutate only registry metadata. Source files are never deleted.
+    bool relocate(const std::string& name, const fs::path& new_source, std::string& error) const {
+        project_t project;
+        if (!valid_name(name)) { error="Invalid project name"; return false; }
+        const fs::path dir=projects_root()/from_utf8(name);
+        std::error_code ec;
+        if (!fs::is_directory(dir,ec) || fs::is_symlink(dir,ec) || new_source.empty()) {
+            error="Invalid project or source directory"; return false;
+        }
+        fs::path src=fs::weakly_canonical(new_source,ec);
+        if (ec || !fs::is_directory(src,ec) || src==src.root_path()) {
+            error="Source folder must already exist"; return false;
+        }
+        fs::path registry=fs::weakly_canonical(projects_root(),ec);
+        if (ec) { error=ec.message(); return false; }
+        auto it=src.begin(); bool inside=true;
+        for (const auto& component : registry) {
+            if (it==src.end() || *it!=component) {inside=false;break;}
+            ++it;
+        }
+        if (inside) {error="Source cannot be inside registry";return false;}
+        fs::path temp=dir/"project.pgr.new";
+        if (fs::exists(temp,ec) || fs::is_symlink(dir/"project.pgr",ec)) {
+            error="Unexpected metadata or pending edit; refusing overwrite";return false;
+        }
+        {
+            std::ofstream stream(temp,std::ios::binary|std::ios::trunc);
+            stream << "# PGR_make project record v1\nsource=" << utf8(src) << '\n';
+            if (!stream) { fs::remove(temp,ec); error="Cannot write metadata"; return false; }
+        }
+        // Windows rename cannot atomically replace an existing file; keep a backup.
+        fs::path original=dir/"project.pgr", backup=dir/"project.pgr.bak";
+        if (fs::exists(backup,ec) || !fs::is_regular_file(original,ec)) {
+            fs::remove(temp,ec); error="Missing metadata or previous backup"; return false;
+        }
+        fs::rename(original,backup,ec);
+        if (ec) { fs::remove(temp,ec); error="Cannot back up metadata"; return false; }
+        fs::rename(temp,original,ec);
+        if (ec) { std::error_code revert; fs::rename(backup,original,revert); error="Cannot install metadata";return false; }
+        fs::remove(backup,ec); return true;
+    }
+    bool rename_project(const std::string& old_name, const std::string& new_name, std::string& error) const {
+        if (!valid_name(old_name) || !valid_name(new_name)) {error="Invalid project name";return false;}
+        const auto origin=projects_root()/from_utf8(old_name), destination=projects_root()/from_utf8(new_name);
+        std::error_code ec;
+        if (!fs::is_directory(origin,ec) || fs::is_symlink(origin,ec) || fs::exists(destination,ec)) {
+            error="Missing project or target already exists";return false;
+        }
+        fs::rename(origin,destination,ec);
+        if (ec) {error=ec.message();return false;}
+        // Owned build artifacts from old name remain in source folder and are not removed.
+        return true;
+    }
+    bool clone_project(const std::string& source_name, const std::string& clone_name,
+                       std::string& error) const {
+        project_t original, created;
+        error.clear();
+        if (!read(source_name,original,error)) return false;
+        if (!create(clone_name,original.source_root,created,error)) return false;
+        std::error_code ec;
+        const auto copy_safe=[&](const fs::path& src,const fs::path& dst)->bool {
+            if (!fs::is_regular_file(src,ec) || fs::is_symlink(src,ec)) return false;
+            return fs::copy_file(src,dst,fs::copy_options::none,ec) && !ec;
+        };
+        if (!copy_safe(original.config(),created.config())) {
+            fs::remove_all(created.store_root,ec);
+            error="Cannot duplicate config.cfg";return false;
+        }
+        if (fs::is_directory(original.profiles(),ec)) {
+            for (fs::directory_iterator it(original.profiles(),ec),end;!ec && it!=end;it.increment(ec)) {
+                if (it->path().extension()!=".cfg" || !copy_safe(it->path(),created.profiles()/it->path().filename())) {
+                    error="Cannot copy one of the profiles (symlinks are forbidden)";break;
+                }
+            }
+        }
+        if (!error.empty()) {
+            fs::remove_all(created.store_root,ec);
+            return false;
+        }
+        return true;
+    }
+    bool archive(const std::string& name, std::string& error) const {
+        if (!valid_name(name)) {error="Invalid project name";return false;}
+        const auto original=projects_root()/from_utf8(name);
+        std::error_code ec;
+        if (!fs::is_directory(original,ec) || fs::is_symlink(original,ec)) {
+            error="Project entry is unavailable";return false;
+        }
+        const auto archive_root=projects_root()/".pgr_archived";
+        fs::create_directories(archive_root,ec);
+        if (ec || fs::is_symlink(archive_root,ec)) {error="Invalid archive location";return false;}
+        fs::path destination=archive_root/from_utf8(name);
+        for (int i=1; fs::exists(destination,ec) && i<10000; ++i)
+            destination=archive_root/from_utf8(name+"_"+std::to_string(i));
+        if (fs::exists(destination,ec)) {error="Archive name conflict";return false;}
+        fs::rename(original,destination,ec);
+        if (ec) {error=ec.message();return false;}
+        return true;
+    }
+
     std::vector<project_t> list() const {
         std::vector<project_t> items;
         std::error_code ec;
         for (fs::directory_iterator it(projects_root(), fs::directory_options::skip_permission_denied, ec), end;
              !ec && it != end; it.increment(ec)) {
-            if (!it->is_directory() || it->is_symlink()) continue;
+            if (!it->is_directory() || it->is_symlink() ||
+                it->path().filename().u8string().rfind(".",0)==0) continue;
             project_t p;
             std::string error;
             if (read(utf8(it->path().filename()), p, error)) items.push_back(std::move(p));

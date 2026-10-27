@@ -1,0 +1,1525 @@
+/**
+ * PGR_Make GTK4 frontend. Build operations are performed by PGR_Make CLI.
+ * One project model, one config.cfg, and no duplicated compiler backend.
+ * Layout: GtkPaned, editor / commands at left, project list at right.
+ */
+#include <gtk/gtk.h>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <cctype>
+#include <ctime>
+#include <cstring>
+#include "../core/diagnostics.hpp"
+#include "../core/build_controller.hpp"
+#include "../core/toolchain_manager.hpp"
+#include "../core/pack_manager.hpp"
+#include "../core/make.hpp"
+#include "../core/pack_tools.hpp"
+#include "../core/project_setup.hpp"
+#include "../core/workspace.hpp"
+
+namespace fs = std::filesystem;
+using pgr_workspace::project_t;
+using pgr_workspace::registry_t;
+
+struct Choice {
+    GtkWidget* dropdown = nullptr;
+    GtkWidget* custom = nullptr;
+    std::vector<std::string> values; // Does not include the final custom entry
+};
+struct Gui {
+    explicit Gui(fs::path root) : registry(std::move(root)) { catalog.load_builtin(); }
+    registry_t registry;
+    flag_catalog_t catalog;
+    std::vector<std::string> installed_tool_ids(const std::string& type) {
+        std::vector<std::string> values={""};
+        pgr_pack_manager::manager manager(registry.pack_root(),registry.root());
+        std::string error;
+        if(manager.load(error))for(const auto& item:manager.entries())
+            if(item.tool==type || (type=="compiler" && (item.tool=="gcc"||item.tool=="clang"||item.tool=="msvc")))
+                values.push_back(item.id);
+        return values;
+    }
+    std::vector<project_t> projects;
+    project_t selected{};
+    bool refreshing = false;
+    bool loading = false;
+    bool dirty = false;
+    bool busy = false;
+    std::thread worker;
+    pgr_process::cancel_token cancellation;
+    std::vector<bool> project_available;
+    GtkWidget* project_search = nullptr;
+    GtkWidget* settings_form = nullptr;
+    GtkWidget* build_choice = nullptr;
+    GtkWidget* dirty_indicator = nullptr;
+    GtkWidget *severity_errors = nullptr, *severity_warnings = nullptr;
+    GtkWidget *history_view = nullptr;
+    GtkWidget *window = nullptr, *project_list = nullptr, *project_path = nullptr;
+    GtkWidget *status = nullptr, *left_controls = nullptr, *stop_button = nullptr;
+    GtkWidget *log_view = nullptr, *diagnostics_box = nullptr, *diags_count = nullptr;
+    GtkWidget *results = nullptr, *profile = nullptr, *build_mode = nullptr;
+    GtkWidget *compiler = nullptr, *compiler_type = nullptr;
+    GtkTextBuffer* log_buffer = nullptr;
+    std::map<std::string, Choice> singles;
+    std::map<std::string, std::vector<std::pair<std::string, GtkWidget*>>> multis;
+    std::map<std::string, GtkWidget*> fields;
+    std::map<std::string, GtkWidget*> lists;
+    std::vector<GtkWidget*> project_actions;
+    std::vector<GtkWidget*> quick_actions;
+};
+static std::string path_utf8(const fs::path& p) { return pgr_workspace::utf8(p); }
+static void set_status(Gui* ui, const std::string& value) {
+    gtk_label_set_text(GTK_LABEL(ui->status), value.c_str());
+}
+static GtkWidget* label(const char* text) {
+    GtkWidget* w = gtk_label_new(text);
+    gtk_label_set_xalign(GTK_LABEL(w), 0);
+    return w;
+}
+static GtkWidget* row(int gap = 8) { return gtk_box_new(GTK_ORIENTATION_HORIZONTAL, gap); }
+static GtkWidget* column(int gap = 8) { return gtk_box_new(GTK_ORIENTATION_VERTICAL, gap); }
+static void margins(GtkWidget* w, int m = 12) {
+    gtk_widget_set_margin_start(w, m); gtk_widget_set_margin_end(w, m);
+    gtk_widget_set_margin_top(w, m); gtk_widget_set_margin_bottom(w, m);
+}
+static void log_line(Gui* ui, const std::string& s) {
+    GtkTextIter end;
+    gtk_text_buffer_get_end_iter(ui->log_buffer, &end);
+    gtk_text_buffer_insert(ui->log_buffer, &end, (s + "\n").c_str(), -1);
+    const int count = gtk_text_buffer_get_char_count(ui->log_buffer);
+    if (count > 140000) {
+        GtkTextIter a, b;
+        gtk_text_buffer_get_start_iter(ui->log_buffer, &a);
+        gtk_text_buffer_get_iter_at_offset(ui->log_buffer, &b, count - 100000);
+        gtk_text_buffer_delete(ui->log_buffer, &a, &b);
+    }
+    gtk_text_buffer_get_end_iter(ui->log_buffer, &end);
+    gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(ui->log_view), &end, 0., FALSE, 0., 1.);
+}
+static void set_busy(Gui* ui, bool busy) {
+    gtk_widget_set_sensitive(ui->left_controls, !busy && !ui->selected.name.empty());
+    gtk_widget_set_sensitive(ui->project_list, !busy);
+    if (ui->build_choice) gtk_widget_set_sensitive(ui->build_choice,!busy);
+    for (auto* button : ui->project_actions) gtk_widget_set_sensitive(button, !busy);
+    for (auto* button : ui->quick_actions)
+        gtk_widget_set_sensitive(button, !busy && !ui->selected.name.empty());
+    gtk_widget_set_sensitive(ui->stop_button, busy);
+    ui->busy = busy;
+}
+static GtkWidget* action(Gui* ui, GtkWidget* container,
+                         const char* title, const char* id);
+static void show_diagnostics(Gui* ui);
+static void show_history(Gui* ui);
+static bool save_settings(Gui* ui);
+static void load_project(Gui* ui, const project_t& project);
+static void refresh_projects(Gui* ui, const std::string& preferred = {});
+static void mark_dirty(Gui* ui) {
+    if (ui->loading || ui->selected.name.empty()) return;
+    ui->dirty = true;
+    if (ui->dirty_indicator) gtk_label_set_text(GTK_LABEL(ui->dirty_indicator), "● Не сохранено");
+}
+static void changed_text(GtkEditable*, gpointer data) { mark_dirty(static_cast<Gui*>(data)); }
+static void changed_buffer(GtkTextBuffer*, gpointer data) { mark_dirty(static_cast<Gui*>(data)); }
+static void changed_selection(GObject*, GParamSpec*, gpointer data) { mark_dirty(static_cast<Gui*>(data)); }
+static void changed_check(GtkCheckButton*, gpointer data) { mark_dirty(static_cast<Gui*>(data)); }
+static void observe_changes(Gui* ui) {
+    for (auto& item : ui->fields)
+        g_signal_connect(item.second,"changed",G_CALLBACK(changed_text),ui);
+    for (auto& item : ui->singles) {
+        g_signal_connect(item.second.dropdown,"notify::selected",G_CALLBACK(changed_selection),ui);
+        g_signal_connect(item.second.custom,"changed",G_CALLBACK(changed_text),ui);
+    }
+    for (auto& item : ui->lists)
+        g_signal_connect(gtk_text_view_get_buffer(GTK_TEXT_VIEW(item.second)),"changed",G_CALLBACK(changed_buffer),ui);
+    for (auto& item : ui->multis) for (auto& flag : item.second)
+        g_signal_connect(flag.second,"toggled",G_CALLBACK(changed_check),ui);
+}
+
+
+// Lists are intentionally multiline, one source/include/library/package per line.
+static std::vector<std::string> split_lines(const std::string& s) {
+    std::vector<std::string> out;
+    std::istringstream in(s);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        const size_t first = line.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        const size_t last = line.find_last_not_of(" \t");
+        out.push_back(line.substr(first, last - first + 1));
+    }
+    return out;
+}
+static std::string join_lines(const std::vector<std::string>& values) {
+    std::string s;
+    for (const auto& v : values) { if (!s.empty()) s += '\n'; s += v; }
+    return s;
+}
+static std::string get_entry(GtkWidget* w) {
+    return w ? gtk_editable_get_text(GTK_EDITABLE(w)) : "";
+}
+static void set_entry(GtkWidget* w, const std::string& s) {
+    if (w) gtk_editable_set_text(GTK_EDITABLE(w), s.c_str());
+}
+static std::string text_contents(GtkWidget* view) {
+    GtkTextBuffer* b = gtk_text_view_get_buffer(GTK_TEXT_VIEW(view));
+    GtkTextIter begin, end;
+    gtk_text_buffer_get_bounds(b, &begin, &end);
+    gchar* s = gtk_text_buffer_get_text(b, &begin, &end, FALSE);
+    std::string value = s ? s : "";
+    g_free(s);
+    return value;
+}
+static void set_text(GtkWidget* view, const std::string& s) {
+    gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(view)), s.c_str(), -1);
+}
+static std::string choice_value(const Choice& c) {
+    const guint index = gtk_drop_down_get_selected(GTK_DROP_DOWN(c.dropdown));
+    return index < c.values.size() ? c.values[index] : get_entry(c.custom);
+}
+static void choice_set(Choice& c, const std::string& value) {
+    for (size_t i = 0; i < c.values.size(); ++i) {
+        if (value == c.values[i]) { gtk_drop_down_set_selected(GTK_DROP_DOWN(c.dropdown), static_cast<guint>(i)); return; }
+    }
+    set_entry(c.custom, value);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(c.dropdown), static_cast<guint>(c.values.size()));
+}
+static void on_choice_changed(GObject* object, GParamSpec*, gpointer data) {
+    auto* custom = GTK_WIDGET(data);
+    auto* dd = GTK_DROP_DOWN(object);
+    // The user can supply flags absent from the bundled catalog.
+    const guint selected = gtk_drop_down_get_selected(dd);
+    const guint custom_index = GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(dd), "custom-index"));
+    gtk_widget_set_visible(custom, selected == custom_index);
+}
+static void add_choice(Gui* ui, GtkWidget* parent, const char* key,
+                       const char* caption, const std::vector<std::string>& values,
+                       const std::vector<std::string>& explanations = {}) {
+    GtkWidget* container = column(4);
+    gtk_box_append(GTK_BOX(container), label(caption));
+    GtkWidget* horizontal = row();
+    std::vector<std::string> options;
+    options.reserve(values.size() + 1);
+    for (size_t i = 0; i < values.size(); ++i) {
+        std::string text = values[i].empty() ? "(не задано)" : values[i];
+        if (i < explanations.size() && !explanations[i].empty()) text += " · " + explanations[i];
+        options.push_back(std::move(text));
+    }
+    options.push_back("Другое значение…");
+    std::vector<const char*> strings;
+    for (const auto& s : options) strings.push_back(s.c_str());
+    strings.push_back(nullptr);
+    GtkWidget* dd = gtk_drop_down_new_from_strings(strings.data());
+    gtk_widget_set_hexpand(dd, TRUE);
+    GtkWidget* custom = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(custom), "Пользовательское значение");
+    gtk_widget_set_hexpand(custom, TRUE);
+    gtk_widget_set_visible(custom, FALSE);
+    g_object_set_data(G_OBJECT(dd), "custom-index", GUINT_TO_POINTER(static_cast<guint>(values.size())));
+    g_signal_connect(dd, "notify::selected", G_CALLBACK(on_choice_changed), custom);
+    gtk_box_append(GTK_BOX(horizontal), dd);
+    gtk_box_append(GTK_BOX(horizontal), custom);
+    gtk_box_append(GTK_BOX(container), horizontal);
+    gtk_box_append(GTK_BOX(parent), container);
+    ui->singles[key] = {dd, custom, values};
+}
+static void add_multi(Gui* ui, GtkWidget* parent, const char* key,
+                      const char* caption, const flag_group_t* group) {
+    GtkWidget* exp = gtk_expander_new(caption);
+    GtkWidget* wrap = column(3);
+    margins(wrap, 8);
+    if (group) {
+        for (const auto& item : group->entries) {
+            GtkWidget* cb = gtk_check_button_new_with_label(item.flag.c_str());
+            gtk_widget_set_tooltip_text(cb, item.description.c_str());
+            gtk_box_append(GTK_BOX(wrap), cb);
+            ui->multis[key].emplace_back(item.flag, cb);
+        }
+    }
+    GtkWidget* custom_label = label("Другие флаги (по одному на строку):");
+    gtk_box_append(GTK_BOX(wrap), custom_label);
+    GtkWidget* custom = gtk_text_view_new();
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(custom), GTK_WRAP_NONE);
+    gtk_widget_set_size_request(custom, -1, 58);
+    gtk_box_append(GTK_BOX(wrap), custom);
+    ui->lists[std::string("extra_") + key] = custom;
+    gtk_expander_set_child(GTK_EXPANDER(exp), wrap);
+    gtk_box_append(GTK_BOX(parent), exp);
+}
+static std::vector<std::string> read_multi(Gui* ui, const std::string& key) {
+    std::vector<std::string> out;
+    for (auto& [value, widget] : ui->multis[key])
+        if (gtk_check_button_get_active(GTK_CHECK_BUTTON(widget))) out.push_back(value);
+    for (const auto& value : split_lines(text_contents(ui->lists["extra_" + key])))
+        if (std::find(out.begin(), out.end(), value) == out.end()) out.push_back(value);
+    return out;
+}
+static void load_multi(Gui* ui, const std::string& key, const std::vector<std::string>& v) {
+    std::vector<std::string> extra;
+    for (const auto& flag : v) {
+        bool known = false;
+        for (const auto& item : ui->multis[key]) if (item.first == flag) known = true;
+        if (!known) extra.push_back(flag);
+    }
+    for (auto& [value, widget] : ui->multis[key])
+        gtk_check_button_set_active(GTK_CHECK_BUTTON(widget),
+            std::find(v.begin(), v.end(), value) != v.end());
+    set_text(ui->lists["extra_" + key], join_lines(extra));
+}
+
+// GTK's native file chooser is supported by GTK4/Windows. The response handler
+// owns the callback state; no dangling pointer to a transient dialog is kept.
+struct BrowseState { Gui* ui; GtkWidget* target; bool multiline; std::string kind; };
+static void browse_finished(GObject* object, GAsyncResult* result, gpointer payload) {
+    std::unique_ptr<BrowseState> state(static_cast<BrowseState*>(payload));
+    GtkFileDialog* dialog = GTK_FILE_DIALOG(object);
+    GError* error = nullptr;
+    const bool folder = state->kind == "folder" || state->kind == "package_dir";
+    GFile* file = folder ? gtk_file_dialog_select_folder_finish(dialog, result, &error)
+                         : gtk_file_dialog_open_finish(dialog, result, &error);
+    // Cancelled dialogs have no effect on the configuration.
+    g_clear_error(&error);
+    if (file) {
+        gchar* path = g_file_get_path(file);
+        if (path) {
+            std::string value(path);
+            if (state->kind == "package") {
+                fs::path p = pgr_workspace::from_utf8(value);
+                std::string name = p.filename().u8string();
+                const auto cut = name.find("Config.cmake");
+                const auto low = name.find("-config.cmake");
+                if (cut != std::string::npos) name = name.substr(0, cut);
+                else if (low != std::string::npos) name = name.substr(0, low);
+                if (cut == std::string::npos && low == std::string::npos) {
+                    set_status(state->ui, "Выберите FooConfig.cmake или foo-config.cmake");
+                } else if (!name.empty()) {
+                    auto packages = split_lines(text_contents(state->target));
+                    if (std::find(packages.begin(), packages.end(), name) == packages.end()) packages.push_back(name);
+                    set_text(state->target, join_lines(packages));
+                    auto dirs = split_lines(text_contents(state->ui->lists["package_dirs"]));
+                    const std::string location = path_utf8(p.parent_path());
+                    if (std::find(dirs.begin(), dirs.end(), location) == dirs.end()) dirs.push_back(location);
+                    set_text(state->ui->lists["package_dirs"], join_lines(dirs));
+                }
+            } else if (state->multiline) {
+                if (state->kind == "sources" && !state->ui->selected.name.empty()) {
+                    auto relative = pgr_workspace::from_utf8(value).lexically_relative(state->ui->selected.source_root);
+                    if (!relative.empty() && relative.generic_u8string().rfind("..", 0) != 0)
+                        value = relative.generic_u8string();
+                }
+                auto all = split_lines(text_contents(state->target));
+                if (std::find(all.begin(), all.end(), value) == all.end()) all.push_back(value);
+                set_text(state->target, join_lines(all));
+            } else set_entry(state->target, value);
+            g_free(path);
+        }
+        g_object_unref(file);
+    }
+    g_object_unref(state->target);
+}
+static void browse(GtkButton* button, gpointer data) {
+    auto* ui = static_cast<Gui*>(data);
+    const char* field = static_cast<const char*>(g_object_get_data(G_OBJECT(button), "field"));
+    const char* kind = static_cast<const char*>(g_object_get_data(G_OBJECT(button), "kind"));
+    if (!field || !kind) return;
+    auto it = ui->fields.find(field);
+    auto lit = ui->lists.find(field);
+    GtkWidget* target = it != ui->fields.end() ? it->second : (lit != ui->lists.end() ? lit->second : nullptr);
+    if (!target) return;
+    const std::string type(kind);
+    const bool folder = type == "folder" || type == "package_dir";
+    GtkFileDialog* dialog = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dialog, folder ? "Выберите каталог" : "Выберите файл");
+    auto* state = new BrowseState{ui, GTK_WIDGET(g_object_ref(target)), lit != ui->lists.end(), type};
+    if (folder) gtk_file_dialog_select_folder(dialog, GTK_WINDOW(ui->window), nullptr, browse_finished, state);
+    else gtk_file_dialog_open(dialog, GTK_WINDOW(ui->window), nullptr, browse_finished, state);
+    g_object_unref(dialog);
+}
+static GtkWidget* path_field(Gui* ui, GtkWidget* parent, const char* key, const char* caption,
+                             const char* browse_kind = nullptr) {
+    GtkWidget* wrap = column(4);
+    gtk_box_append(GTK_BOX(wrap), label(caption));
+    GtkWidget* h = row();
+    GtkWidget* entry = gtk_entry_new();
+    gtk_widget_set_hexpand(entry, TRUE);
+    ui->fields[key] = entry;
+    gtk_box_append(GTK_BOX(h), entry);
+    if (browse_kind) {
+        GtkWidget* b = gtk_button_new_with_label("Обзор…");
+        g_object_set_data_full(G_OBJECT(b), "field", g_strdup(key), g_free);
+        g_object_set_data_full(G_OBJECT(b), "kind", g_strdup(browse_kind), g_free);
+        g_signal_connect(b, "clicked", G_CALLBACK(browse), ui);
+        gtk_box_append(GTK_BOX(h), b);
+    }
+    gtk_box_append(GTK_BOX(wrap), h);
+    gtk_box_append(GTK_BOX(parent), wrap);
+    return entry;
+}
+static void list_field(Gui* ui, GtkWidget* parent, const char* key, const char* caption,
+                       const char* browse_kind = nullptr) {
+    GtkWidget* wrap = column(4);
+    gtk_box_append(GTK_BOX(wrap), label(caption));
+    GtkWidget* scroller = gtk_scrolled_window_new();
+    gtk_widget_set_size_request(scroller, -1, 70);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    GtkWidget* view = gtk_text_view_new();
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(view), GTK_WRAP_NONE);
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(view), TRUE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), view);
+    ui->lists[key] = view;
+    gtk_box_append(GTK_BOX(wrap), scroller);
+    if (browse_kind) {
+        GtkWidget* b = gtk_button_new_with_label("+ Добавить через проводник…");
+        g_object_set_data_full(G_OBJECT(b), "field", g_strdup(key), g_free);
+        g_object_set_data_full(G_OBJECT(b), "kind", g_strdup(browse_kind), g_free);
+        g_signal_connect(b, "clicked", G_CALLBACK(browse), ui);
+        gtk_box_append(GTK_BOX(wrap), b);
+    }
+    gtk_box_append(GTK_BOX(parent), wrap);
+}
+static GtkWidget* section(GtkWidget* parent, const char* title) {
+    GtkWidget* exp = gtk_expander_new(title);
+    GtkWidget* inside = column(9);
+    margins(inside, 10);
+    gtk_expander_set_child(GTK_EXPANDER(exp), inside);
+    gtk_box_append(GTK_BOX(parent), exp);
+    return inside;
+}
+static void add_group_choice(Gui* ui, GtkWidget* box, const char* key, const char* caption) {
+    std::vector<std::string> values = {""}, desc = {""};
+    if (auto* group = ui->catalog.find(key))
+        for (const auto& entry : group->entries) { values.push_back(entry.flag); desc.push_back(entry.description); }
+    add_choice(ui, box, key, caption, values, desc);
+}
+static void build_configuration_form(Gui* ui, GtkWidget* host) {
+    GtkWidget* general = section(host, "1–4. Компилятор и язык");
+    path_field(ui, general, "compiler", "1. Компилятор (имя или полный путь)", "file");
+    action(ui, general, "31. Выбрать компилятор из Pack", "pack");
+    add_group_choice(ui, general, "standard", "2. Стандарт C++");
+    add_group_choice(ui, general, "optimization", "3. Оптимизация");
+    add_group_choice(ui, general, "debug", "4. Отладочная информация");
+    add_choice(ui, general, "c_standard", "27. Стандарт C", {"", "-std=c99", "-std=c11", "-std=c17", "-std=c23"});
+    GtkWidget* versions = section(host, "Pack Manager · версии и окружение сборки");
+    gtk_box_append(GTK_BOX(versions),label("Закреплённые версии запускаются по абсолютным путям. Пустое значение = автоматический поиск."));
+    add_choice(ui,versions,"compiler_id","Компилятор (GCC/Clang/MSVC)",ui->installed_tool_ids("compiler"));
+    add_choice(ui,versions,"cmake_id","Версия CMake",ui->installed_tool_ids("cmake"));
+    add_choice(ui,versions,"ninja_id","Версия Ninja",ui->installed_tool_ids("ninja"));
+    add_choice(ui,versions,"objcopy_id","Версия objcopy",ui->installed_tool_ids("objcopy"));
+    action(ui,versions,"Открыть менеджер Pack…","pack-manager");
+
+    GtkWidget* flags = section(host, "5–10. Флаги и оптимизация");
+    add_multi(ui, flags, "warnings", "5. Предупреждения (множественный выбор)", ui->catalog.find("warnings"));
+    add_multi(ui, flags, "sanitizers", "6. Санитайзеры (множественный выбор)", ui->catalog.find("sanitizers"));
+    add_group_choice(ui, flags, "lto", "7. LTO");
+    add_group_choice(ui, flags, "arch", "8. Архитектура");
+    add_multi(ui, flags, "specific_gcc", "9. Дополнительные GCC-флаги", ui->catalog.find("specific_gcc"));
+    add_multi(ui, flags, "specific_clang", "10. Дополнительные Clang-флаги", ui->catalog.find("specific_clang"));
+
+    GtkWidget* files = section(host, "11–15. Исходники и пути");
+    list_field(ui, files, "source_files", "11. Исходники (по одному на строку)", "sources");
+    path_field(ui, files, "output_file", "12. Выходной файл относительно каталога проекта");
+    list_field(ui, files, "include_dirs", "13. Include dirs (по одному каталогу на строку)", "folder");
+    list_field(ui, files, "library_dirs", "14. Library dirs (по одному каталогу на строку)", "folder");
+    list_field(ui, files, "libraries", "15. Библиотеки (имя или полный путь к файлу)", "file");
+
+    GtkWidget* cmake = section(host, "22–29. CMake, пакеты и профили");
+    list_field(ui, cmake, "packages", "22. Пакеты find_package (Foo или Foo|Foo::Target)", "package");
+    list_field(ui, cmake, "package_dirs", "Каталоги поиска CMake-пакетов (CMAKE_PREFIX_PATH)", "folder");
+    add_choice(ui, cmake, "profile", "23. Профиль", {"", "debug", "release"});
+    action(ui, cmake, "23. Сохранить профиль…", "profile-save");
+    action(ui, cmake, "23. Загрузить профиль…", "profile-load");
+    path_field(ui, cmake, "toolchain_file", "26. CMake toolchain file", "file");
+    path_field(ui, cmake, "linker_script", "28. Linker script (.ld)", "file");
+    add_choice(ui, cmake, "target_type", "29. Тип библиотеки", {"", "static", "shared", "object", "interface"});
+    path_field(ui, cmake, "toolchain_prefix", "36. Префикс кросс-компилятора");
+    add_choice(ui, cmake, "package_manager", "37. Пакетный менеджер", {"none", "vcpkg", "conan"});
+    path_field(ui, cmake, "objcopy", "38. Программа objcopy", "file");
+
+    GtkWidget* actions = section(host, "16–38. Команды TUI");
+    const std::vector<std::pair<const char*, const char*>> commands = {
+        {"16. Показать команду прямой компиляции", "command"},
+        {"17. Собрать напрямую", "direct"},
+        {"18. Сгенерировать CMakeLists.txt", "generate"},
+        {"19. Собрать через PGR CMake", "build"},
+        {"20. Сохранить конфигурацию", "save"},
+        {"21. Загрузить конфигурацию", "reload"},
+        {"24. Очистить каталог сборки", "clean"},
+        {"25. Экспортировать compile_commands.json", "export"},
+        {"30. Выбрать другой проект (справа)", "switch"},
+        {"32. Собрать существующий CMakeLists.txt", "native"},
+        {"33. Показать диагностику", "diagnostics"},
+        {"34. Проверить clangd", "analyze"},
+        {"35. Создать CMakePresets.json", "presets"},
+        {"0. Выход", "exit"}
+    };
+    for (const auto& [caption, cmd] : commands) action(ui, actions, caption, cmd);
+}
+
+static bool save_settings(Gui* ui) {
+    if (ui->selected.name.empty()) { set_status(ui, "Сначала выберите проект"); return false; }
+    make_t build;
+    if (build.load(path_utf8(ui->selected.config())) != 0) {
+        set_status(ui, "Не удалось загрузить config.cfg"); return false;
+    }
+    const auto field = [ui](const char* key) { return get_entry(ui->fields.at(key)); };
+    const auto lines = [ui](const char* key) { return split_lines(text_contents(ui->lists.at(key))); };
+    const auto pick = [ui](const char* key) { return choice_value(ui->singles.at(key)); };
+    build.set_compiler(field("compiler"));
+    build.set_pins(pick("compiler_id"),pick("cmake_id"),pick("ninja_id"),pick("objcopy_id"));
+    build.set_standard(pick("standard"));
+    build.set_optimization(pick("optimization"));
+    build.set_debug(pick("debug"));
+    build.set_lto(pick("lto"));
+    build.set_arch(pick("arch"));
+    build.set_c_standard(pick("c_standard"));
+    build.set_target_type(pick("target_type"));
+    build.set_profile(pick("profile"));
+    build.set_package_manager(pick("package_manager"));
+    build.set_output_file(field("output_file"));
+    build.set_toolchain_file(field("toolchain_file"));
+    build.set_linker_script(field("linker_script"));
+    build.set_toolchain_prefix(field("toolchain_prefix"));
+    build.set_objcopy(field("objcopy"));
+    build.set_source_files(lines("source_files"));
+    build.set_include_dirs(lines("include_dirs"));
+    build.set_library_dirs(lines("library_dirs"));
+    build.set_libraries(lines("libraries"));
+    build.set_packages(lines("packages"));
+    build.set_package_dirs(lines("package_dirs"));
+    build.set_warnings(read_multi(ui, "warnings"));
+    build.set_sanitizers(read_multi(ui, "sanitizers"));
+    build.set_specific_gcc(read_multi(ui, "specific_gcc"));
+    build.set_specific_clang(read_multi(ui, "specific_clang"));
+    if (build.validate_configuration() != 0) {
+        set_status(ui, "Ошибка параметров: проверьте флаги, пакеты и совместимость санитайзеров");
+        return false;
+    }
+    if (build.save(path_utf8(ui->selected.config())) != 0) {
+        set_status(ui, "Не удалось записать config.cfg"); return false;
+    }
+    ui->dirty = false;
+    if (ui->dirty_indicator) gtk_label_set_text(GTK_LABEL(ui->dirty_indicator), "Сохранено");
+    set_status(ui, "Настройки сохранены: " + ui->selected.name);
+    return true;
+}
+
+static void load_project(Gui* ui, const project_t& project) {
+    ui->selected = project;
+    ui->loading = true;
+    gtk_label_set_text(GTK_LABEL(ui->project_path), path_utf8(project.source_root).c_str());
+    make_t build;
+    if (build.load(path_utf8(project.config())) != 0) {
+        set_status(ui, "Не удалось загрузить конфигурацию: " + project.name);
+        ui->loading = false;
+        set_busy(ui, false);
+        return;
+    }
+    const auto& c = build.config();
+    const auto put = [ui](const char* key, const std::string& value) { set_entry(ui->fields.at(key), value); };
+    const auto putlist = [ui](const char* key, const std::vector<std::string>& values) {
+        set_text(ui->lists.at(key), join_lines(values));
+    };
+    const auto choose = [ui](const char* key, const std::string& value) {
+        choice_set(ui->singles.at(key), value);
+    };
+    put("compiler", c.compiler);
+    put("output_file", c.output_file);
+    put("toolchain_file", c.toolchain_file);
+    put("linker_script", c.linker_script);
+    put("toolchain_prefix", c.toolchain_prefix);
+    put("objcopy", c.objcopy);
+    choose("compiler_id",c.compiler_id);
+    choose("cmake_id",c.cmake_id);
+    choose("ninja_id",c.ninja_id);
+    choose("objcopy_id",c.objcopy_id);
+    choose("standard", c.standard);
+    choose("optimization", c.optimization);
+    choose("debug", c.debug);
+    choose("lto", c.lto);
+    choose("arch", c.arch);
+    choose("c_standard", c.c_standard);
+    choose("target_type", c.target_type);
+    choose("profile", c.profile);
+    choose("package_manager", c.package_manager.empty() ? "none" : c.package_manager);
+    putlist("source_files", c.source_files);
+    putlist("include_dirs", c.include_dirs);
+    putlist("library_dirs", c.library_dirs);
+    putlist("libraries", c.libraries);
+    putlist("packages", c.packages);
+    putlist("package_dirs", c.package_dirs);
+    load_multi(ui, "warnings", c.warnings);
+    load_multi(ui, "sanitizers", c.sanitizers);
+    load_multi(ui, "specific_gcc", c.specific_gcc);
+    load_multi(ui, "specific_clang", c.specific_clang);
+    ui->loading = false;
+    ui->dirty = false;
+    if (ui->dirty_indicator) gtk_label_set_text(GTK_LABEL(ui->dirty_indicator), "Сохранено");
+    show_diagnostics(ui);
+    show_history(ui);
+    set_status(ui, "Открыт проект: " + project.name);
+    set_busy(ui, false);
+}
+
+struct SwitchDialog { Gui* ui; project_t next; GtkWidget* dialog; };
+static void switch_destroy(gpointer value) { delete static_cast<SwitchDialog*>(value); }
+static void switch_clicked(GtkButton* button, gpointer payload) {
+    auto* context=static_cast<SwitchDialog*>(payload);
+    const char* operation=static_cast<const char*>(g_object_get_data(G_OBJECT(button),"switch-kind"));
+    const std::string type=operation?operation:"cancel";
+    if (type=="save" && !save_settings(context->ui)) return;
+    if (type!="cancel") load_project(context->ui,context->next);
+    gtk_window_destroy(GTK_WINDOW(context->dialog));
+}
+static void request_switch(Gui* ui, const project_t& incoming) {
+    if (!ui->dirty || ui->selected.name.empty() || ui->selected.name==incoming.name) {
+        load_project(ui,incoming); return;
+    }
+    GtkWidget* dialog=gtk_window_new();
+    auto* state=new SwitchDialog{ui,incoming,dialog};
+    g_object_set_data_full(G_OBJECT(dialog),"pgr-switch",state,switch_destroy);
+    gtk_window_set_title(GTK_WINDOW(dialog),"Несохранённые изменения");
+    gtk_window_set_transient_for(GTK_WINDOW(dialog),GTK_WINDOW(ui->window));
+    gtk_window_set_modal(GTK_WINDOW(dialog),TRUE);
+    GtkWidget* body=column(12); margins(body,18);
+    gtk_window_set_child(GTK_WINDOW(dialog),body);
+    gtk_box_append(GTK_BOX(body),label("Сохранить изменения перед переключением проекта?"));
+    GtkWidget* buttons=row(8);
+    for (auto& choice : std::vector<std::pair<const char*,const char*>>{
+        {"Сохранить","save"},{"Без сохранения","discard"},{"Отмена","cancel"}}) {
+        auto* b=gtk_button_new_with_label(choice.first);
+        g_object_set_data(G_OBJECT(b),"switch-kind",const_cast<char*>(choice.second));
+        g_signal_connect(b,"clicked",G_CALLBACK(switch_clicked),state);
+        gtk_box_append(GTK_BOX(buttons),b);
+    }
+    gtk_box_append(GTK_BOX(body),buttons);
+    gtk_window_present(GTK_WINDOW(dialog));
+}
+static int project_row_index(Gui* ui, GtkListBoxRow* row) {
+    if (!row) return -1;
+    const char* name=static_cast<const char*>(g_object_get_data(G_OBJECT(row),"pgr-project-name"));
+    if (!name) return -1;
+    for (size_t i=0;i<ui->projects.size();++i)
+        if (ui->projects[i].name==name) return static_cast<int>(i);
+    return -1;
+}
+static void project_activated(GtkListBox*, GtkListBoxRow* row, gpointer data) {
+    auto* ui=static_cast<Gui*>(data);
+    if (ui->refreshing || ui->busy || !row) return;
+    const int index=project_row_index(ui,row);
+    if (index<0) return;
+    if (!ui->project_available[static_cast<size_t>(index)]) {
+        set_status(ui,"Исходники недоступны. Выберите «Изменить путь» для восстановления проекта.");
+        return;
+    }
+    request_switch(ui,ui->projects[static_cast<size_t>(index)]);
+}
+static void refresh_projects(Gui* ui, const std::string& preferred) {
+    const auto desired = preferred.empty() ? ui->selected.name : preferred;
+    ui->refreshing = true;
+    for (GtkWidget* w = gtk_widget_get_first_child(ui->project_list); w;) {
+        GtkWidget* next = gtk_widget_get_next_sibling(w);
+        gtk_list_box_remove(GTK_LIST_BOX(ui->project_list), w);
+        w = next;
+    }
+    ui->projects.clear();
+    ui->project_available.clear();
+    for (const auto& entry : ui->registry.entries()) {
+        ui->projects.push_back({entry.name,entry.source,ui->registry.projects_root()/pgr_workspace::from_utf8(entry.name)});
+        ui->project_available.push_back(entry.available);
+    }
+    int selection = -1;
+    for (size_t i = 0; i < ui->projects.size(); ++i) {
+        auto* project = gtk_list_box_row_new();
+        g_object_set_data_full(G_OBJECT(project),"pgr-project-name",
+                               g_strdup(ui->projects[i].name.c_str()),g_free);
+        GtkWidget* name = label((ui->projects[i].name +
+            (ui->project_available[i] ? "" : "  [нет исходников]")).c_str());
+        gtk_widget_set_margin_top(name, 9);
+        gtk_widget_set_margin_bottom(name, 9);
+        gtk_widget_set_margin_start(name, 10);
+        gtk_widget_set_margin_end(name, 10);
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(project), name);
+        gtk_list_box_append(GTK_LIST_BOX(ui->project_list), project);
+        if (ui->projects[i].name == desired && ui->project_available[i]) selection = static_cast<int>(i);
+    }
+    if (selection < 0)
+        for (size_t i=0;i<ui->projects.size();++i)
+            if (ui->project_available[i]) { selection=static_cast<int>(i); break; }
+    ui->refreshing = false;
+    if (ui->project_list) gtk_list_box_invalidate_filter(GTK_LIST_BOX(ui->project_list));
+    if (selection >= 0) {
+        GtkListBoxRow* selected = gtk_list_box_get_row_at_index(GTK_LIST_BOX(ui->project_list), selection);
+        gtk_list_box_select_row(GTK_LIST_BOX(ui->project_list), selected);
+        load_project(ui, ui->projects[static_cast<size_t>(selection)]);
+    } else {
+        ui->selected = {};
+        gtk_label_set_text(GTK_LABEL(ui->project_path), "Проект не выбран");
+        set_status(ui, "Создайте первый проект справа");
+        set_busy(ui, false);
+    }
+}
+static void on_diagnostic_activated(GtkListBox*, GtkListBoxRow* row, gpointer data) {
+    auto* ui = static_cast<Gui*>(data);
+    const char* raw = static_cast<const char*>(g_object_get_data(G_OBJECT(row), "path"));
+    if (!raw || !*raw || ui->selected.name.empty()) return;
+    auto path = pgr_workspace::from_utf8(raw);
+    if (path.is_relative()) path = ui->selected.source_root / path;
+    if (!fs::is_regular_file(path)) { set_status(ui, "Не найден файл: " + path_utf8(path)); return; }
+    const int line = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "line"));
+    const int col = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "col"));
+    const std::string location = path_utf8(path) + ":" + std::to_string(std::max(1, line)) +
+                                 ":" + std::to_string(std::max(1, col));
+    const gchar* argv[] = {"code", "--goto", location.c_str(), nullptr};
+    GError* error = nullptr;
+    GSubprocess* editor = g_subprocess_newv(argv, G_SUBPROCESS_FLAGS_NONE, &error);
+    if (editor) { g_object_unref(editor); return; }
+    g_clear_error(&error);
+    GFile* file = g_file_new_for_path(path_utf8(path).c_str());
+    gchar* uri = g_file_get_uri(file);
+    if (!g_app_info_launch_default_for_uri(uri, nullptr, &error)) {
+        set_status(ui, std::string("Ошибка открытия файла: ") + (error ? error->message : "unknown"));
+        g_clear_error(&error);
+    }
+    g_free(uri);
+    g_object_unref(file);
+}
+static void show_diagnostics(Gui* ui) {
+    for (GtkWidget* w = gtk_widget_get_first_child(ui->diagnostics_box); w;) {
+        GtkWidget* next = gtk_widget_get_next_sibling(w);
+        gtk_list_box_remove(GTK_LIST_BOX(ui->diagnostics_box), w);
+        w = next;
+    }
+    if (ui->selected.name.empty()) return;
+    pgr_diagnostics::collector report;
+    if (!report.load(ui->selected.store_root / "diagnostics.json")) {
+        gtk_label_set_text(GTK_LABEL(ui->diags_count), "Нет отчёта"); return;
+    }
+    int errors = 0, warnings = 0;
+    for (const auto& d : report.records()) {
+        errors += d.severity == "error";
+        warnings += d.severity == "warning";
+        const bool include_error = d.severity == "error";
+        const bool include_warning = d.severity == "warning";
+        if ((include_error && ui->severity_errors &&
+             !gtk_check_button_get_active(GTK_CHECK_BUTTON(ui->severity_errors))) ||
+            (include_warning && ui->severity_warnings &&
+             !gtk_check_button_get_active(GTK_CHECK_BUTTON(ui->severity_warnings)))) continue;
+        std::string message = "[" + d.severity + "/" + d.category + "] " + d.file;
+        if (d.line > 0) message += ":" + std::to_string(d.line);
+        if (d.column > 0) message += ":" + std::to_string(d.column);
+        message += "  " + d.message;
+        GtkWidget* row_widget = gtk_list_box_row_new();
+        GtkWidget* line = label(message.c_str());
+        gtk_label_set_wrap(GTK_LABEL(line), TRUE);
+        margins(line, 6);
+        gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(row_widget), line);
+        g_object_set_data_full(G_OBJECT(row_widget), "path", g_strdup(d.file.c_str()), g_free);
+        g_object_set_data(G_OBJECT(row_widget), "line", GINT_TO_POINTER(d.line));
+        g_object_set_data(G_OBJECT(row_widget), "col", GINT_TO_POINTER(d.column));
+        gtk_list_box_append(GTK_LIST_BOX(ui->diagnostics_box), row_widget);
+    }
+    gtk_label_set_text(GTK_LABEL(ui->diags_count),
+        (std::to_string(errors) + " ошибок, " + std::to_string(warnings) + " предупреждений").c_str());
+}
+static void diagnostic_filter_changed(GtkCheckButton*,gpointer data) {
+    show_diagnostics(static_cast<Gui*>(data));
+}
+static void copy_diagnostic(GtkButton*,gpointer payload) {
+    auto* ui=static_cast<Gui*>(payload);
+    auto* row=gtk_list_box_get_selected_row(GTK_LIST_BOX(ui->diagnostics_box));
+    if (!row) {set_status(ui,"Выберите сообщение в списке");return;}
+    auto* text=gtk_list_box_row_get_child(row);
+    if (!GTK_IS_LABEL(text)) return;
+    GdkClipboard* clipboard=gtk_widget_get_clipboard(ui->window);
+    gdk_clipboard_set_text(clipboard,gtk_label_get_text(GTK_LABEL(text)));
+    set_status(ui,"Сообщение скопировано");
+}
+static void show_history(Gui* ui) {
+    if (!ui->history_view) return;
+    std::ifstream file(ui->selected.store_root/"history.log",std::ios::binary);
+    if (!file) {set_text(ui->history_view,"История сборок пока пуста.");return;}
+    std::vector<std::string> lines;
+    std::string input;
+    while (std::getline(file,input)) {
+        std::istringstream row(input);
+        std::string timestamp,code,elapsed,mode;
+        if (!std::getline(row,timestamp,'\t') || !std::getline(row,code,'\t') ||
+            !std::getline(row,elapsed,'\t') || !std::getline(row,mode,'\t')) continue;
+        try {
+            const std::time_t epoch=std::stoll(timestamp)/1000;
+            char date[40]={};
+            const auto* local=std::localtime(&epoch);
+            if (local) std::strftime(date,sizeof(date),"%Y-%m-%d %H:%M:%S",local);
+            lines.push_back(std::string(date)+" | "+(code=="0"?"OK":code=="130"?"ОТМЕНА":"ОШИБКА "+code)+
+                " | "+mode+" | "+elapsed+" мс");
+        } catch (...) {}
+    }
+    if (lines.size()>100) lines.erase(lines.begin(),lines.end()-100);
+    std::reverse(lines.begin(),lines.end());
+    set_text(ui->history_view,join_lines(lines));
+}
+struct WorkMessage {
+    Gui* ui;
+    std::string text;
+    int rc = 0;
+    bool completed = false;
+};
+static gboolean work_on_main(gpointer payload) {
+    auto* message=static_cast<WorkMessage*>(payload);
+    auto* ui=message->ui;
+    if (message->completed) {
+        if (ui->worker.joinable()) ui->worker.join();
+        const bool cancelled = message->rc == 130;
+        log_line(ui,cancelled?"[PGR] Сборка остановлена":
+            message->rc==0?"[PGR] Выполнено":"[PGR] Ошибка (код "+std::to_string(message->rc)+")");
+        set_status(ui,cancelled?"Остановлено":message->rc==0?"Готово":"Сбой, см. журнал и диагностику");
+        set_busy(ui,false);
+        show_diagnostics(ui);
+        show_history(ui);
+    } else log_line(ui,message->text);
+    return G_SOURCE_REMOVE;
+}
+static void work_message_free(gpointer payload) {delete static_cast<WorkMessage*>(payload);}
+static void post_work(Gui* ui, std::string message, int rc=0, bool completed=false) {
+    g_idle_add_full(G_PRIORITY_DEFAULT,work_on_main,new WorkMessage{ui,std::move(message),rc,completed},work_message_free);
+}
+static void run_pack_cli(Gui* ui, std::vector<std::string> args,const std::string& caption) {
+    if(ui->busy) {set_status(ui,"Сначала завершите текущую операцию");return;}
+    if(ui->worker.joinable())ui->worker.join();
+    ui->cancellation.requested.store(false);
+    const auto home=ui->registry.root();
+    gtk_text_buffer_set_text(ui->log_buffer,"",-1);
+    log_line(ui,"[Pack] "+caption);
+    set_busy(ui,true);
+    ui->worker=std::thread([ui,home,args=std::move(args)]() {
+        fs::path executable=home/
+#ifdef _WIN32
+           "PGR_Make.exe";
+#else
+           "PGR_Make";
+#endif
+        std::vector<std::string> command={path_utf8(executable),"--home",path_utf8(home)};
+        command.insert(command.end(),args.begin(),args.end());
+        pgr_process::options opt;opt.quiet=true;opt.cancel=&ui->cancellation;
+        opt.output=[ui](const std::string& line){post_work(ui,line);};
+        const int rc=pgr_process::run_ex(command,opt);
+        post_work(ui,rc==0?"Pack: операция завершена. Для обновления списков версий перезапустите GUI.":"Pack: операция не удалась. См. журнал.",rc,true);
+    });
+}
+static void run_cli(Gui* ui,std::vector<std::string> args,const std::string& caption) {
+    if (ui->busy || ui->selected.name.empty()) return;
+    if (ui->worker.joinable()) ui->worker.join();
+    ui->cancellation.requested.store(false);
+    const bool main_build=std::find(args.begin(),args.end(),"--ci")!=args.end();
+    const bool direct=std::find(args.begin(),args.end(),"--direct")!=args.end();
+    const bool native=std::find(args.begin(),args.end(),"--native-cmake")!=args.end();
+    const project_t project=ui->selected;
+    const auto home=ui->registry.root(),pack=ui->registry.pack_root();
+    const auto compiler=get_entry(ui->fields.at("compiler"));
+    gtk_text_buffer_set_text(ui->log_buffer,"",-1);
+    log_line(ui,"[PGR] "+caption+" · "+project.name);
+    set_status(ui,"Выполняется: "+caption);
+    set_busy(ui,true);
+    ui->worker=std::thread([ui,main_build,direct,native,project,home,pack,args=std::move(args),compiler]() {
+        int rc=-1;
+        if (main_build) {
+            pgr_build::options opt; opt.pack=pack; opt.native_cmake=native; opt.direct=direct;
+            pgr_build::hooks hooks;
+            hooks.cancel=&ui->cancellation;
+            hooks.on_output=[ui](const std::string& text){post_work(ui,text);};
+            rc=pgr_build::run(project,opt,hooks);
+        } else {
+            fs::path executable=home/
+#ifdef _WIN32
+                "PGR_Make.exe";
+#else
+                "PGR_Make";
+#endif
+            std::vector<std::string> command={path_utf8(executable),"--home",path_utf8(home),"--project",project.name};
+            command.insert(command.end(),args.begin(),args.end());
+            pgr_process::options opt;
+            opt.quiet=true;
+            opt.cancel=&ui->cancellation;
+            opt.working_directory=project.source_root;
+            opt.output=[ui](const std::string& line){post_work(ui,line);};
+            rc=pgr_process::run_ex(command,opt);
+        }
+        post_work(ui,"",rc,true);
+    });
+}
+
+struct CreateDialog {
+    Gui* ui;
+    GtkWidget *window, *name, *source, *starter;
+};
+static void create_dialog_destroy(gpointer ptr) { delete static_cast<CreateDialog*>(ptr); }
+static void create_folder_finished(GObject* object, GAsyncResult* result, gpointer payload) {
+    GtkWidget* entry = GTK_WIDGET(payload);
+    GError* error = nullptr;
+    GFile* file = gtk_file_dialog_select_folder_finish(GTK_FILE_DIALOG(object), result, &error);
+    g_clear_error(&error);
+    if (file) {
+        gchar* name = g_file_get_path(file);
+        if (name) { set_entry(entry, name); g_free(name); }
+        g_object_unref(file);
+    }
+    g_object_unref(entry);
+}
+static void create_browse(GtkButton*, gpointer ptr) {
+    auto* dialog = static_cast<CreateDialog*>(ptr);
+    GtkFileDialog* chooser = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(chooser, "Исходники проекта");
+    gtk_file_dialog_select_folder(chooser, GTK_WINDOW(dialog->window), nullptr,
+                                  create_folder_finished, g_object_ref(dialog->source));
+    g_object_unref(chooser);
+}
+static void create_project(GtkButton*, gpointer ptr) {
+    auto* dialog = static_cast<CreateDialog*>(ptr);
+    const std::string name = get_entry(dialog->name);
+    const auto directory = pgr_workspace::from_utf8(get_entry(dialog->source));
+    project_t created;
+    std::string error;
+    if (!pgr_project::create_project(dialog->ui->registry, name, directory,
+            gtk_check_button_get_active(GTK_CHECK_BUTTON(dialog->starter)), created, error)) {
+        set_status(dialog->ui, "Ошибка создания: " + error);
+        return;
+    }
+    refresh_projects(dialog->ui, name);
+    gtk_window_destroy(GTK_WINDOW(dialog->window));
+}
+static void open_create_dialog(Gui* ui) {
+    auto* dlg = new CreateDialog{};
+    dlg->ui = ui;
+    dlg->window = gtk_window_new();
+    g_object_set_data_full(G_OBJECT(dlg->window), "pgr-create-context", dlg, create_dialog_destroy);
+    gtk_window_set_transient_for(GTK_WINDOW(dlg->window), GTK_WINDOW(ui->window));
+    gtk_window_set_modal(GTK_WINDOW(dlg->window), TRUE);
+    gtk_window_set_title(GTK_WINDOW(dlg->window), "Новый проект");
+    gtk_window_set_default_size(GTK_WINDOW(dlg->window), 520, 250);
+    GtkWidget* content = column(10);
+    margins(content);
+    gtk_window_set_child(GTK_WINDOW(dlg->window), content);
+    gtk_box_append(GTK_BOX(content), label("Название проекта"));
+    dlg->name = gtk_entry_new();
+    gtk_box_append(GTK_BOX(content), dlg->name);
+    gtk_box_append(GTK_BOX(content), label("Каталог исходников"));
+    GtkWidget* source_row = row();
+    dlg->source = gtk_entry_new();
+    gtk_widget_set_hexpand(dlg->source, TRUE);
+    gtk_box_append(GTK_BOX(source_row), dlg->source);
+    GtkWidget* browse_button = gtk_button_new_with_label("Обзор…");
+    gtk_box_append(GTK_BOX(source_row), browse_button);
+    g_signal_connect(browse_button, "clicked", G_CALLBACK(create_browse), dlg);
+    gtk_box_append(GTK_BOX(content), source_row);
+    dlg->starter = gtk_check_button_new_with_label("Создать пример main.cpp при необходимости");
+    gtk_box_append(GTK_BOX(content), dlg->starter);
+    GtkWidget* confirm = gtk_button_new_with_label("Создать проект");
+    gtk_widget_add_css_class(confirm, "suggested-action");
+    g_signal_connect(confirm, "clicked", G_CALLBACK(create_project), dlg);
+    gtk_box_append(GTK_BOX(content), confirm);
+    gtk_window_present(GTK_WINDOW(dlg->window));
+}
+struct ProjectOperation {
+    Gui* ui;
+    std::string name, kind;
+    GtkWidget *dialog, *entry;
+};
+static void project_operation_destroy(gpointer ptr) {delete static_cast<ProjectOperation*>(ptr);}
+static void project_operation_confirm(GtkButton*, gpointer payload) {
+    auto* state=static_cast<ProjectOperation*>(payload);
+    std::string error;
+    auto* ui=state->ui;
+    const std::string value=get_entry(state->entry);
+    bool success=false;
+    if (state->kind=="rename") success=ui->registry.rename_project(state->name,value,error);
+    else if (state->kind=="relocate") success=ui->registry.relocate(state->name,pgr_workspace::from_utf8(value),error);
+    else if (state->kind=="archive") success=ui->registry.archive(state->name,error);
+    else if (state->kind=="clone") success=ui->registry.clone_project(state->name,value,error);
+    if (!success) {set_status(ui,"Операция не выполнена: "+error);return;}
+    if (ui->selected.name==state->name) {ui->selected={};ui->dirty=false;}
+    const std::string next=state->kind=="rename" || state->kind=="clone"?value:"";
+    gtk_window_destroy(GTK_WINDOW(state->dialog));
+    refresh_projects(ui,next);
+    set_status(ui,"Запись проекта обновлена. Исходные файлы не затронуты.");
+}
+static void open_project_operation(Gui* ui,const std::string& kind) {
+    if (ui->busy || ui->dirty) {
+        set_status(ui,"Перед управлением реестром сохраните настройки и завершите сборку");return;
+    }
+    GtkListBoxRow* selected=gtk_list_box_get_selected_row(GTK_LIST_BOX(ui->project_list));
+    if (!selected) {set_status(ui,"Выберите проект справа");return;}
+    const int index=project_row_index(ui,selected);
+    if (index<0) return;
+    const auto& item=ui->projects[static_cast<size_t>(index)];
+    auto* dialog=gtk_window_new();
+    const std::string title=kind=="rename"?"Переименовать проект":
+        kind=="relocate"?"Изменить каталог исходников":
+        kind=="clone"?"Клонировать настройки проекта":"Убрать проект из списка";
+    gtk_window_set_title(GTK_WINDOW(dialog),title.c_str());
+    gtk_window_set_transient_for(GTK_WINDOW(dialog),GTK_WINDOW(ui->window));
+    gtk_window_set_modal(GTK_WINDOW(dialog),TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(dialog),540,-1);
+    auto* state=new ProjectOperation{ui,item.name,kind,dialog,nullptr};
+    g_object_set_data_full(G_OBJECT(dialog),"project-operation",state,project_operation_destroy);
+    auto* box=column(10);margins(box,16);
+    gtk_window_set_child(GTK_WINDOW(dialog),box);
+    gtk_box_append(GTK_BOX(box),label(("Проект: "+item.name).c_str()));
+    if (kind=="archive")
+        gtk_box_append(GTK_BOX(box),label("Будут архивированы только файлы реестра. Исходники и build сохраняются."));
+    else {
+        gtk_box_append(GTK_BOX(box),label(kind=="rename" || kind=="clone"?"Новое имя:":"Существующий каталог исходников:"));
+        state->entry=gtk_entry_new();
+        gtk_editable_set_text(GTK_EDITABLE(state->entry),
+            kind=="rename"?item.name.c_str():kind=="clone"?"":path_utf8(item.source_root).c_str());
+        gtk_box_append(GTK_BOX(box),state->entry);
+    }
+    auto* button=gtk_button_new_with_label(kind=="archive"?"Архивировать запись":"Применить");
+    if (kind=="archive") gtk_widget_add_css_class(button,"destructive-action");
+    g_signal_connect(button,"clicked",G_CALLBACK(project_operation_confirm),state);
+    gtk_box_append(GTK_BOX(box),button);
+    gtk_window_present(GTK_WINDOW(dialog));
+}
+static gboolean filter_project(GtkListBoxRow* row,gpointer data) {
+    auto* ui=static_cast<Gui*>(data);
+    const char* query=gtk_editable_get_text(GTK_EDITABLE(ui->project_search));
+    if (!query || !*query) return TRUE;
+    const int index=project_row_index(ui,row);
+    if (index<0) return TRUE;
+    const auto& record=ui->projects[static_cast<size_t>(index)];
+    gchar* needle=g_utf8_casefold(query,-1);
+    gchar* name=g_utf8_casefold(record.name.c_str(),-1);
+    gchar* source=g_utf8_casefold(path_utf8(record.source_root).c_str(),-1);
+    gboolean matches=(strstr(name,needle)!=nullptr || strstr(source,needle)!=nullptr);
+    g_free(needle);g_free(name);g_free(source);
+    return matches;
+}
+static void search_projects_changed(GtkEditable*,gpointer data) {
+    auto* ui=static_cast<Gui*>(data);
+    gtk_list_box_invalidate_filter(GTK_LIST_BOX(ui->project_list));
+}
+static void settings_search_changed(GtkEditable* input,gpointer data) {
+    auto* ui=static_cast<Gui*>(data);
+    gchar* query=g_utf8_casefold(gtk_editable_get_text(input),-1);
+    for (GtkWidget* child=gtk_widget_get_first_child(ui->settings_form);child;
+         child=gtk_widget_get_next_sibling(child)) {
+        const char* caption=GTK_IS_EXPANDER(child)?gtk_expander_get_label(GTK_EXPANDER(child)):"";
+        gchar* lowered=g_utf8_casefold(caption?caption:"",-1);
+        const bool matches=!*query || strstr(lowered,query)!=nullptr;
+        gtk_widget_set_visible(child,matches);
+        if (*query && matches && GTK_IS_EXPANDER(child))
+            gtk_expander_set_expanded(GTK_EXPANDER(child),TRUE);
+        g_free(lowered);
+    }
+    g_free(query);
+}
+static void primary_build(GtkButton*,gpointer data) {
+    auto* ui=static_cast<Gui*>(data);
+    if (ui->busy || ui->selected.name.empty() || !save_settings(ui)) return;
+    guint mode=gtk_drop_down_get_selected(GTK_DROP_DOWN(ui->build_choice));
+    if (mode==1) run_cli(ui,{"--ci","--native-cmake"},"Сборка существующего CMake");
+    else if (mode==2) run_cli(ui,{"--ci","--direct"},"Прямая сборка");
+    else run_cli(ui,{"--ci"},"Сборка PGR CMake");
+}
+struct CompilerChoice { Gui* ui; std::string path; };
+static void release_compiler_choice(gpointer ptr, GClosure*) { delete static_cast<CompilerChoice*>(ptr); }
+static void compiler_picked(GtkButton* button, gpointer ptr) {
+    auto* choice = static_cast<CompilerChoice*>(ptr);
+    set_entry(choice->ui->fields["compiler"], choice->path);
+    GtkWidget* window = gtk_widget_get_ancestor(GTK_WIDGET(button), GTK_TYPE_WINDOW);
+    if (window) gtk_window_destroy(GTK_WINDOW(window));
+}
+static void open_pack_dialog(Gui* ui) {
+    const auto candidates = pgr_pack::compilers(ui->registry.pack_root());
+    if (candidates.empty()) {
+        set_status(ui, "В Pack нет компиляторов. Используйте поле «Компилятор»."); return;
+    }
+    GtkWidget* dialog = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(dialog), "Компиляторы из Pack");
+    gtk_window_set_transient_for(GTK_WINDOW(dialog), GTK_WINDOW(ui->window));
+    gtk_window_set_modal(GTK_WINDOW(dialog), TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(dialog), 590, 360);
+    GtkWidget* scroll = gtk_scrolled_window_new();
+    gtk_window_set_child(GTK_WINDOW(dialog), scroll);
+    GtkWidget* list = column(4);
+    margins(list);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), list);
+    for (const auto& path : candidates) {
+        const auto value = path_utf8(path);
+        GtkWidget* button = gtk_button_new_with_label(value.c_str());
+        gtk_box_append(GTK_BOX(list), button);
+        auto* choice = new CompilerChoice{ui, value};
+        g_signal_connect_data(button, "clicked", G_CALLBACK(compiler_picked),
+                              choice, release_compiler_choice, G_CONNECT_DEFAULT);
+    }
+    gtk_window_present(GTK_WINDOW(dialog));
+}
+struct SaveProfileDialog { Gui* ui; GtkWidget *window, *name; };
+static void save_profile_context(gpointer ptr) { delete static_cast<SaveProfileDialog*>(ptr); }
+static void finish_save_profile(GtkButton*, gpointer payload) {
+    auto* dlg = static_cast<SaveProfileDialog*>(payload);
+    auto* ui = dlg->ui;
+    const std::string name = get_entry(dlg->name);
+    if (!pgr_workspace::valid_name(name)) { set_status(ui, "Недопустимое имя профиля"); return; }
+    if (!save_settings(ui)) return;
+    const fs::path location = ui->selected.profiles() / pgr_workspace::from_utf8(name + ".cfg");
+    std::error_code ec;
+    fs::create_directories(location.parent_path(), ec);
+    if (ec || fs::exists(location)) { set_status(ui, "Профиль существует или недоступен: " + name); return; }
+    make_t config;
+    if (config.load(path_utf8(ui->selected.config())) != 0) return;
+    config.set_profile(name);
+    if (config.save(path_utf8(location)) != 0) { set_status(ui, "Не удалось сохранить профиль"); return; }
+    set_status(ui, "Сохранён профиль: " + name);
+    gtk_window_destroy(GTK_WINDOW(dlg->window));
+}
+static void open_save_profile(Gui* ui) {
+    if (ui->selected.name.empty()) return;
+    auto* dialog = new SaveProfileDialog{};
+    dialog->ui = ui;
+    dialog->window = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(dialog->window), "Сохранение профиля");
+    gtk_window_set_transient_for(GTK_WINDOW(dialog->window), GTK_WINDOW(ui->window));
+    gtk_window_set_modal(GTK_WINDOW(dialog->window), TRUE);
+    g_object_set_data_full(G_OBJECT(dialog->window), "profile-dialog", dialog, save_profile_context);
+    GtkWidget* body = column(8);
+    margins(body);
+    gtk_window_set_child(GTK_WINDOW(dialog->window), body);
+    gtk_box_append(GTK_BOX(body), label("Имя нового профиля:"));
+    dialog->name = gtk_entry_new();
+    gtk_box_append(GTK_BOX(body), dialog->name);
+    GtkWidget* button = gtk_button_new_with_label("Сохранить");
+    g_signal_connect(button, "clicked", G_CALLBACK(finish_save_profile), dialog);
+    gtk_box_append(GTK_BOX(body), button);
+    gtk_window_present(GTK_WINDOW(dialog->window));
+}
+struct ProfileLoadState { Gui* ui; std::string project_name; };
+static void profile_load_finished(GObject* object, GAsyncResult* result, gpointer payload) {
+    std::unique_ptr<ProfileLoadState> state(static_cast<ProfileLoadState*>(payload));
+    auto* ui = state->ui;
+    GError* error = nullptr;
+    GFile* file = gtk_file_dialog_open_finish(GTK_FILE_DIALOG(object), result, &error);
+    g_clear_error(&error);
+    if (!file) return;
+    gchar* path = g_file_get_path(file);
+    if (path) {
+        make_t profile;
+        const fs::path file_path = pgr_workspace::from_utf8(path);
+        if (profile.load(path) != 0) {
+            set_status(ui, "Не удалось загрузить выбранный профиль");
+        } else if (ui->selected.name != state->project_name) {
+            set_status(ui, "Проект изменён, загрузка профиля отменена");
+        } else {
+            profile.set_profile(file_path.stem().u8string());
+            if (profile.save(path_utf8(ui->selected.config())) == 0) {
+                load_project(ui, ui->selected);
+                set_status(ui, "Загружен профиль: " + file_path.stem().u8string());
+            } else set_status(ui, "Не удалось сохранить настройки профиля");
+        }
+        g_free(path);
+    }
+    g_object_unref(file);
+}
+static void open_load_profile(Gui* ui) {
+    if (ui->selected.name.empty()) return;
+    GtkFileDialog* chooser = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(chooser, "Выберите файл профиля (*.cfg)");
+    gtk_file_dialog_open(chooser, GTK_WINDOW(ui->window), nullptr, profile_load_finished,
+                         new ProfileLoadState{ui, ui->selected.name});
+    g_object_unref(chooser);
+}
+static void on_profile_changed(GObject*, GParamSpec*, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    if (ui->loading) return;
+    const std::string profile = choice_value(ui->singles.at("profile"));
+    if (profile == "debug") {
+        choice_set(ui->singles.at("optimization"), "-O0");
+        choice_set(ui->singles.at("debug"), "-g");
+    } else if (profile == "release") {
+        choice_set(ui->singles.at("optimization"), "-O2");
+        choice_set(ui->singles.at("debug"), "");
+    }
+}
+static void confirm_clean(GtkButton*, gpointer ptr) {
+    auto* ui = static_cast<Gui*>(ptr);
+    GtkWidget* window = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(window), "Подтверждение очистки");
+    gtk_window_set_transient_for(GTK_WINDOW(window), GTK_WINDOW(ui->window));
+    gtk_window_set_modal(GTK_WINDOW(window), TRUE);
+    GtkWidget* body = column(10);
+    margins(body);
+    gtk_window_set_child(GTK_WINDOW(window), body);
+    gtk_box_append(GTK_BOX(body), label("Удалить только принадлежащий PGR_Make каталог сборки?"));
+    GtkWidget* confirm = gtk_button_new_with_label("Очистить");
+    gtk_widget_add_css_class(confirm, "destructive-action");
+    gtk_box_append(GTK_BOX(body), confirm);
+    // Hold the GTK dialog alive only until the click callback returns.
+    g_signal_connect(confirm, "clicked", G_CALLBACK(+[](GtkButton* button, gpointer payload) {
+        auto* gui = static_cast<Gui*>(payload);
+        GtkWidget* dialog = gtk_widget_get_ancestor(GTK_WIDGET(button), GTK_TYPE_WINDOW);
+        if (dialog) gtk_window_destroy(GTK_WINDOW(dialog));
+        run_cli(gui, {"--clean-only"}, "Очистка каталога сборки");
+    }), ui);
+    gtk_window_present(GTK_WINDOW(window));
+}
+struct PackAction {Gui* ui;std::string id,operation;};
+static void dispose_pack_action(gpointer data,GClosure*) {delete static_cast<PackAction*>(data);}
+static void pack_zip_done(GObject* object,GAsyncResult* result,gpointer data) {
+    std::unique_ptr<PackAction> action(static_cast<PackAction*>(data));
+    GError* error=nullptr;
+    GFile* file=gtk_file_dialog_open_finish(GTK_FILE_DIALOG(object),result,&error);
+    if(file) {
+        gchar* filename=g_file_get_path(file);
+        if(filename){run_pack_cli(action->ui,{"--pack-import",action->id,filename},"Импорт локального ZIP "+action->id);g_free(filename);}
+        g_object_unref(file);
+    }
+    g_clear_error(&error);
+}
+static void pack_retire_confirmed(GtkButton* button,gpointer data) {
+    auto* action=static_cast<PackAction*>(data);
+    GtkWidget* window=gtk_widget_get_ancestor(GTK_WIDGET(button),GTK_TYPE_WINDOW);
+    if(window)gtk_window_close(GTK_WINDOW(window));
+    run_pack_cli(action->ui,{"--pack-retire",action->id},"Карантин версии "+action->id);
+}
+static void pack_action_clicked(GtkButton* button,gpointer data) {
+    auto* item=static_cast<PackAction*>(data);
+    if(item->operation=="import") {
+        GtkFileDialog* chooser=gtk_file_dialog_new();
+        gtk_file_dialog_set_title(chooser,"Локальный архив инструмента (*.zip)");
+        gtk_file_dialog_open(chooser,GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(button),GTK_TYPE_WINDOW)),nullptr,
+                             pack_zip_done,new PackAction(*item));
+        g_object_unref(chooser);
+        return;
+    }
+    if(item->operation=="retire") {
+        GtkWidget* prompt=gtk_window_new();
+        gtk_window_set_title(GTK_WINDOW(prompt),"Подтвердите вывод версии из Pack");
+        gtk_window_set_transient_for(GTK_WINDOW(prompt),GTK_WINDOW(item->ui->window));
+        gtk_window_set_modal(GTK_WINDOW(prompt),TRUE);
+        GtkWidget* body=column(12);margins(body,16);
+        gtk_window_set_child(GTK_WINDOW(prompt),body);
+        gtk_box_append(GTK_BOX(body),label(("Переместить "+item->id+" в Pack/Retired?\nИспользуемые проектами версии не удаляются.").c_str()));
+        GtkWidget* confirm=gtk_button_new_with_label("Переместить в карантин");
+        gtk_widget_add_css_class(confirm,"destructive-action");
+        gtk_box_append(GTK_BOX(body),confirm);
+        g_signal_connect_data(confirm,"clicked",G_CALLBACK(pack_retire_confirmed),new PackAction(*item),dispose_pack_action,G_CONNECT_DEFAULT);
+        gtk_window_present(GTK_WINDOW(prompt));
+        return;
+    }
+    std::vector<std::string> command;
+    if(item->operation=="install")command={"--pack-install",item->id};
+    GtkWidget* parent=gtk_widget_get_ancestor(GTK_WIDGET(button),GTK_TYPE_WINDOW);
+    if(parent)gtk_window_close(GTK_WINDOW(parent));
+    run_pack_cli(item->ui,command,item->operation+" "+item->id);
+}
+static void pack_button(Gui* ui,GtkWidget* row,const char* title,
+                        const std::string& operation,const std::string& id) {
+    GtkWidget* button=gtk_button_new_with_label(title);
+    gtk_box_append(GTK_BOX(row),button);
+    auto* action=new PackAction{ui,id,operation};
+    g_signal_connect_data(button,"clicked",G_CALLBACK(pack_action_clicked),action,dispose_pack_action,G_CONNECT_DEFAULT);
+}
+static void open_pack_manager(Gui* ui) {
+    if(ui->busy){set_status(ui,"Pack занят: завершите текущую сборку");return;}
+    pgr_pack_manager::manager manager(ui->registry.pack_root(),ui->registry.root());
+    std::string error;
+    if(!manager.load(error)){set_status(ui,"Ошибка Pack: "+error);return;}
+    GtkWidget* window=gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(window),"Pack Manager · версии и установка инструментов");
+    gtk_window_set_transient_for(GTK_WINDOW(window),GTK_WINDOW(ui->window));
+    gtk_window_set_modal(GTK_WINDOW(window),TRUE);
+    gtk_window_set_default_size(GTK_WINDOW(window),900,620);
+    GtkWidget* scroll=gtk_scrolled_window_new();
+    GtkWidget* body=column(10);margins(body,16);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),body);
+    gtk_window_set_child(GTK_WINDOW(window),scroll);
+    GtkWidget* heading=label("Установленные инструменты");gtk_widget_add_css_class(heading,"title-3");gtk_box_append(GTK_BOX(body),heading);
+    if(manager.entries().empty())gtk_box_append(GTK_BOX(body),label("Нет зарегистрированных версий. Можно импортировать архив или установить из каталога."));
+    for(const auto& installed:manager.entries()) {
+        std::string why;
+        const bool healthy=pgr_pack_manager::verify_tool(installed,why);
+        GtkWidget* line=row(8);
+        GtkWidget* desc=label((installed.id+"  ["+(healthy?"проверен":"недоступен")+"]\n"+
+                               path_utf8(pgr_pack_manager::executable_path(installed))).c_str());
+        gtk_widget_set_hexpand(desc,TRUE);
+        gtk_box_append(GTK_BOX(line),desc);
+        pack_button(ui,line,"Убрать из Pack","retire",installed.id);
+        gtk_box_append(GTK_BOX(body),line);
+        gtk_box_append(GTK_BOX(body),gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+    }
+    GtkWidget* catalog_title=label("Каталог доступных версий · официальные дистрибутивы с SHA-256");
+    gtk_widget_add_css_class(catalog_title,"title-3");gtk_box_append(GTK_BOX(body),catalog_title);
+    std::vector<pgr_pack_manager::package> available=pgr_pack_manager::catalog(manager.catalog_file(),error);
+    if(!error.empty())gtk_box_append(GTK_BOX(body),label(error.c_str()));
+    for(const auto& pkg:available) {
+        GtkWidget* line=row(8);
+        GtkWidget* desc=label((pkg.id+"\n"+pkg.url).c_str());
+        gtk_widget_set_hexpand(desc,TRUE);gtk_label_set_wrap(GTK_LABEL(desc),TRUE);
+        gtk_box_append(GTK_BOX(line),desc);
+        if(pkg.platform==pgr_pack_manager::platform()&&!manager.find(pkg.id)) {
+            pack_button(ui,line,"Скачать и установить","install",pkg.id);
+            pack_button(ui,line,"Из ZIP…","import",pkg.id);
+        } else gtk_box_append(GTK_BOX(line),label("Не для этой платформы или уже установлен"));
+        gtk_box_append(GTK_BOX(body),line);
+        gtk_box_append(GTK_BOX(body),gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+    }
+    gtk_box_append(GTK_BOX(body),label("Другие GCC/Clang/ARM: добавьте проверенный дистрибутив в Pack/catalog.json или зарегистрируйте внешний toolchain через CLI. MSVC устанавливается штатным установщиком Microsoft."));
+    gtk_window_present(GTK_WINDOW(window));
+}
+static void run_action(GtkButton*, gpointer payload) {
+    // Callback dispatch passes its selected action id in a callback-specific context.
+    auto* pair = static_cast<std::pair<Gui*, std::string>*>(payload);
+    auto* ui = pair->first;
+    const std::string& id = pair->second;
+    if (id == "exit") {
+        if (ui->busy) {ui->cancellation.cancel();return;}
+        if (ui->dirty) {set_status(ui,"Изменения не сохранены. Сохраните настройки перед выходом.");return;}
+        gtk_window_close(GTK_WINDOW(ui->window)); return;
+    }
+    if (id == "new") { open_create_dialog(ui); return; }
+    if (id == "discard") {
+        if (!ui->busy && !ui->selected.name.empty()) load_project(ui,ui->selected);
+        return;
+    }
+    if (id == "exit-discard") {
+        if (!ui->busy) { ui->dirty=false;gtk_window_close(GTK_WINDOW(ui->window)); }
+        return;
+    }
+    if (id == "pack-check") {open_pack_manager(ui);return;}
+    if (id == "pack-manager") {open_pack_manager(ui);return;}
+    if (id == "refresh") {
+        if (!ui->dirty || ui->selected.name.empty() || save_settings(ui)) refresh_projects(ui);
+        return;
+    }
+    if (id == "switch") { set_status(ui, "Выберите проект в правой панели"); return; }
+    if (id=="project-rename" || id=="project-relocate" || id=="project-archive" || id=="project-clone") {
+        open_project_operation(ui,id.substr(8));return;
+    }
+    if (id == "pack") { open_pack_dialog(ui); return; }
+    if (id == "profile-save") { open_save_profile(ui); return; }
+    if (id == "profile-load") { open_load_profile(ui); return; }
+    if (id == "diagnostics") { show_diagnostics(ui); gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results), 1); return; }
+    if (id == "reload") { if (ui->dirty) {set_status(ui,"Не сохранено: сохраните либо переключите проект с выбором «Без сохранения»");return;} if (!ui->selected.name.empty()) load_project(ui, ui->selected); return; }
+    if (id == "save") { save_settings(ui); return; }
+    if (id == "stop") {
+        if (ui->busy) { ui->cancellation.cancel(); set_status(ui, "Останавливаю дерево процессов…"); }
+        return;
+    }
+    if (ui->busy || !save_settings(ui)) return;
+    if (id == "clean") { confirm_clean(nullptr, ui); return; }
+    if (id == "build") run_cli(ui, {"--ci"}, "CMake-сборка");
+    else if (id == "direct") run_cli(ui, {"--ci", "--direct"}, "Прямая компиляция");
+    else if (id == "native") run_cli(ui, {"--ci", "--native-cmake"}, "Существующий CMakeLists.txt");
+    else if (id == "generate") run_cli(ui, {"--generate-only"}, "Генерация CMakeLists.txt");
+    else if (id == "command") run_cli(ui, {"--show-command"}, "Команда компиляции");
+    else if (id == "export") run_cli(ui, {"--export-commands"}, "Экспорт compile_commands.json");
+    else if (id == "analyze") run_cli(ui, {"--analyze"}, "Анализ clangd");
+    else if (id == "presets") run_cli(ui, {"--write-presets"}, "Генерация CMakePresets.json");
+}
+static void release_action(gpointer ptr, GClosure*) {
+    delete static_cast<std::pair<Gui*, std::string>*>(ptr);
+}
+static GtkWidget* action(Gui* ui, GtkWidget* container, const char* title, const char* id) {
+    GtkWidget* button = gtk_button_new_with_label(title);
+    gtk_widget_set_hexpand(button, TRUE);
+    gtk_box_append(GTK_BOX(container), button);
+    auto* ctx = new std::pair<Gui*, std::string>(ui, id);
+    g_signal_connect_data(button, "clicked", G_CALLBACK(run_action), ctx, release_action, G_CONNECT_DEFAULT);
+    if (std::string(id) != "new" && std::string(id) != "refresh" && std::string(id) != "exit" &&
+        std::string(id) != "stop") {
+        // The configuration panel is disabled during builds, including its actions.
+    }
+    return button;
+}
+static gboolean on_close_request(GtkWindow*,gpointer payload) {
+    auto* ui=static_cast<Gui*>(payload);
+    if (ui->busy) {
+        ui->cancellation.cancel();
+        set_status(ui,"Остановка процесса перед закрытием. Закройте окно после завершения.");
+        return TRUE;
+    }
+    if (ui->dirty) {
+        set_status(ui,"Есть несохранённые настройки. Сохраните их либо выберите «Выход» ещё раз.");
+        // Explicit close via the window manager does not auto-write config.
+        return TRUE;
+    }
+    return FALSE;
+}
+static void activate(GtkApplication* app, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    ui->window = gtk_application_window_new(app);
+    gtk_window_set_title(GTK_WINDOW(ui->window), "PGR_Make · GTK4");
+    gtk_window_set_default_size(GTK_WINDOW(ui->window), 1340, 850);
+    g_signal_connect(ui->window,"close-request",G_CALLBACK(on_close_request),ui);
+    GtkWidget* root = column(6);
+    margins(root, 8);
+    gtk_window_set_child(GTK_WINDOW(ui->window), root);
+    GtkWidget* header = row(10);
+    GtkWidget* title = label("PGR_Make · Конфигуратор и сборка");
+    gtk_widget_add_css_class(title, "title-2");
+    gtk_box_append(GTK_BOX(header), title);
+    ui->dirty_indicator=label("Сохранено");
+    gtk_widget_add_css_class(ui->dirty_indicator,"dim-label");
+    gtk_box_append(GTK_BOX(header),ui->dirty_indicator);
+    gtk_box_append(GTK_BOX(root), header);
+
+    // Required orientation: LEFT contains all TUI settings/commands;
+    // RIGHT contains the selectable project list.
+    GtkWidget* paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_widget_set_hexpand(paned, TRUE);
+    gtk_widget_set_vexpand(paned, TRUE);
+    gtk_paned_set_wide_handle(GTK_PANED(paned), TRUE);
+    gtk_paned_set_position(GTK_PANED(paned), 1010);
+    gtk_box_append(GTK_BOX(root), paned);
+
+    GtkWidget* left = column(8);
+    gtk_widget_set_size_request(left, 630, -1);
+    gtk_paned_set_start_child(GTK_PANED(paned), left);
+    GtkWidget* top_commands = row(6);
+    const char* modes[]={"PGR CMake","Существующий CMake","Прямая сборка",nullptr};
+    ui->build_choice=gtk_drop_down_new_from_strings(modes);
+    gtk_widget_set_tooltip_text(ui->build_choice,"Способ сборки проекта");
+    gtk_box_append(GTK_BOX(top_commands),ui->build_choice);
+    GtkWidget* primary=gtk_button_new_with_label("▶ Собрать");
+    gtk_widget_add_css_class(primary,"suggested-action");
+    g_signal_connect(primary,"clicked",G_CALLBACK(primary_build),ui);
+    gtk_box_append(GTK_BOX(top_commands),primary);
+    ui->quick_actions.push_back(primary);
+    ui->quick_actions.push_back(action(ui, top_commands, "Сохранить", "save"));
+    ui->quick_actions.push_back(action(ui, top_commands, "Отменить изменения", "discard"));
+    ui->quick_actions.push_back(action(ui, top_commands, "Собрать CMake", "build"));
+    ui->quick_actions.push_back(action(ui, top_commands, "Собрать напрямую", "direct"));
+    ui->stop_button = action(ui, top_commands, "Остановить", "stop");
+    gtk_box_append(GTK_BOX(left), top_commands);
+
+    GtkWidget* controls = gtk_scrolled_window_new();
+    gtk_widget_set_vexpand(controls, TRUE);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(controls), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    ui->left_controls = controls;
+    GtkWidget* form = column(8);
+    margins(form, 8);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(controls), form);
+    GtkWidget* settings_search=gtk_search_entry_new();
+    gtk_widget_set_hexpand(settings_search,TRUE);
+    g_object_set(G_OBJECT(settings_search),"placeholder-text","Найти раздел: компилятор, флаги, пути, CMake…",nullptr);
+    gtk_box_append(GTK_BOX(left),settings_search);
+    g_signal_connect(settings_search,"changed",G_CALLBACK(settings_search_changed),ui);
+    gtk_box_append(GTK_BOX(left), controls);
+    ui->settings_form=form;
+    build_configuration_form(ui, form);
+    observe_changes(ui);
+    g_signal_connect(ui->singles.at("profile").dropdown, "notify::selected",
+                     G_CALLBACK(on_profile_changed), ui);
+
+    ui->results = gtk_notebook_new();
+    gtk_widget_set_size_request(ui->results, -1, 240);
+    ui->log_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(ui->log_view), FALSE);
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(ui->log_view), TRUE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(ui->log_view), GTK_WRAP_WORD_CHAR);
+    ui->log_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ui->log_view));
+    GtkWidget* logs_scroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(logs_scroll), ui->log_view);
+    gtk_notebook_append_page(GTK_NOTEBOOK(ui->results), logs_scroll, gtk_label_new("Журнал"));
+    GtkWidget* errors_scroll = gtk_scrolled_window_new();
+    GtkWidget* errors = column(6);
+    margins(errors, 6);
+    ui->diags_count = label("Ошибок нет");
+    gtk_box_append(GTK_BOX(errors), ui->diags_count);
+    GtkWidget* diagnostic_controls=row(10);
+    ui->severity_errors=gtk_check_button_new_with_label("Ошибки");
+    ui->severity_warnings=gtk_check_button_new_with_label("Предупреждения");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(ui->severity_errors),TRUE);
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(ui->severity_warnings),TRUE);
+    g_signal_connect(ui->severity_errors,"toggled",G_CALLBACK(diagnostic_filter_changed),ui);
+    g_signal_connect(ui->severity_warnings,"toggled",G_CALLBACK(diagnostic_filter_changed),ui);
+    gtk_box_append(GTK_BOX(diagnostic_controls),ui->severity_errors);
+    gtk_box_append(GTK_BOX(diagnostic_controls),ui->severity_warnings);
+    GtkWidget* copy=gtk_button_new_with_label("Копировать выбранное");
+    g_signal_connect(copy,"clicked",G_CALLBACK(copy_diagnostic),ui);
+    gtk_box_append(GTK_BOX(diagnostic_controls),copy);
+    gtk_box_append(GTK_BOX(errors),diagnostic_controls);
+    ui->diagnostics_box = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(ui->diagnostics_box),GTK_SELECTION_SINGLE);
+    g_signal_connect(ui->diagnostics_box, "row-activated", G_CALLBACK(on_diagnostic_activated), ui);
+    gtk_box_append(GTK_BOX(errors), ui->diagnostics_box);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(errors_scroll), errors);
+    gtk_notebook_append_page(GTK_NOTEBOOK(ui->results), errors_scroll, gtk_label_new("Диагностика"));
+    GtkWidget* history_scroller=gtk_scrolled_window_new();
+    ui->history_view=gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(ui->history_view),FALSE);
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(ui->history_view),TRUE);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(history_scroller),ui->history_view);
+    gtk_notebook_append_page(GTK_NOTEBOOK(ui->results),history_scroller,gtk_label_new("История"));
+    gtk_box_append(GTK_BOX(left), ui->results);
+
+    GtkWidget* right = column(8);
+    gtk_widget_set_size_request(right, 220, -1);
+    margins(right, 6);
+    gtk_paned_set_end_child(GTK_PANED(paned), right);
+    GtkWidget* title_projects = label("ПРОЕКТЫ");
+    gtk_widget_add_css_class(title_projects, "heading");
+    gtk_box_append(GTK_BOX(right), title_projects);
+    GtkWidget* buttons = row(5);
+    GtkWidget* create = action(ui, buttons, "+ Создать", "new");
+    GtkWidget* refresh = action(ui, buttons, "Обновить", "refresh");
+    ui->project_actions.push_back(create);
+    ui->project_actions.push_back(refresh);
+    gtk_box_append(GTK_BOX(right), buttons);
+    ui->project_search=gtk_search_entry_new();
+    g_object_set(G_OBJECT(ui->project_search),"placeholder-text","Поиск по проектам…",nullptr);
+    gtk_box_append(GTK_BOX(right),ui->project_search);
+    GtkWidget* projects_scroll = gtk_scrolled_window_new();
+    gtk_widget_set_vexpand(projects_scroll, TRUE);
+    ui->project_list = gtk_list_box_new();
+    gtk_list_box_set_filter_func(GTK_LIST_BOX(ui->project_list),filter_project,ui,nullptr);
+    g_signal_connect(ui->project_search,"changed",G_CALLBACK(search_projects_changed),ui);
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(ui->project_list), GTK_SELECTION_SINGLE);
+    gtk_list_box_set_activate_on_single_click(GTK_LIST_BOX(ui->project_list), TRUE);
+    g_signal_connect(ui->project_list, "row-activated", G_CALLBACK(project_activated), ui);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(projects_scroll), ui->project_list);
+    gtk_box_append(GTK_BOX(right), projects_scroll);
+    gtk_box_append(GTK_BOX(right), label("Каталог исходников:"));
+    ui->project_path = label("Не выбран");
+    gtk_label_set_wrap(GTK_LABEL(ui->project_path), TRUE);
+    gtk_label_set_selectable(GTK_LABEL(ui->project_path), TRUE);
+    gtk_box_append(GTK_BOX(right), ui->project_path);
+    action(ui,right,"Переименовать","project-rename");
+    action(ui,right,"Клонировать настройки","project-clone");
+    action(ui,right,"Изменить путь исходников","project-relocate");
+    action(ui,right,"Убрать из списка","project-archive");
+    action(ui,right,"Управление версиями Pack…","pack-check");
+    action(ui,right,"Выход","exit");
+    action(ui,right,"Выход без сохранения","exit-discard");
+
+    ui->status = label("Готово");
+    gtk_widget_add_css_class(ui->status, "dim-label");
+    gtk_box_append(GTK_BOX(root), ui->status);
+    refresh_projects(ui);
+    log_line(ui, "PGR_Make GTK4: слева настройки и команды, справа проекты.");
+    gtk_window_present(GTK_WINDOW(ui->window));
+}
+int main(int argc, char** argv) {
+    (void)argc; (void)argv;
+    Gui ui(pgr_workspace::executable_directory());
+    std::string error;
+    if (!ui.registry.ensure(error)) {
+        g_printerr("Cannot initialize PGR workspace: %s\n", error.c_str()); return 1;
+    }
+    GtkApplication* app = gtk_application_new("com.pgr.make", G_APPLICATION_DEFAULT_FLAGS);
+    g_signal_connect(app, "activate", G_CALLBACK(activate), &ui);
+    const int result = g_application_run(G_APPLICATION(app), 0, nullptr);
+    ui.cancellation.cancel();
+    if (ui.worker.joinable()) ui.worker.join();
+    g_object_unref(app);
+    return result;
+}

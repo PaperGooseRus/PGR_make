@@ -1,3 +1,11 @@
+> **Обновление 0.4:** общий BuildController для GUI/CLI, безопасная отмена дерева процессов, история сборок, строгий JSON-разбор, управление записями проектов и обновлённая навигация GTK4. См. [RELEASE_V0_4.md](RELEASE_V0_4.md).
+
+> **GUI 0.2:** интерфейс на GtkPaned с полным набором команд TUI описан в [GUI_PANED.md](GUI_PANED.md).
+
+## GTK4 графический интерфейс (GUI 0.1)
+
+Добавлена отдельная цель `PGR_Make_GUI` (GTK4, C++17) рядом с исходной CLI/TUI программой `PGR_Make`. GUI управляет проектами, настройками, CMake/прямой сборкой, журналом и диагностикой. Инструкция по установке GTK4, сборке в MSYS2 и размещению `C:\PGR`: **[GUI_GTK4.md](GUI_GTK4.md)**. GTK4 на Windows требует внешних DLL/ресурсов, статически слинкованный CLI по-прежнему доступен отдельно.
+
 # PGR_Make — переносимый менеджер сборки C/C++
 
 Версия с **реестром проектов**, отдельным каталогом инструментов и **статической линковкой самого PGR_Make.exe** на MinGW UCRT64.
@@ -131,3 +139,66 @@ python tests/run_tests.py ./build-review/PGR_Make
 Если сгенерированный `Project/<имя>/generated_cmake` остался от предыдущей версии и не имеет маркера `.pgr_make_generated_owner`, PGR_Make остановит генерацию, чтобы не удалить неизвестное содержимое. После сохранения резервной копии этот каталог можно вручную переименовать, затем запустить генерацию повторно.
 
 `--native-cmake` предназначен для проектов с готовым `CMakeLists.txt` и не переносит автоматически флаги из `config.cfg` в оригинальный CMake-проект: они должны быть предусмотрены исходной конфигурацией CMake (кроме передаваемых компиляторов и toolchain-файла).
+
+---
+
+## 7. Toolchain, пакетные менеджеры и целевые типы CMake
+
+Существующие конфигурации работают без миграции. Новые необязательные ключи:
+
+```ini
+# GNU cross-toolchain: compiler=g++ преобразуется в arm-none-eabi-g++
+compiler=g++
+toolchain_prefix=arm-none-eabi-
+objcopy=arm-none-eabi-objcopy
+output_file=build/firmware.elf
+# static / shared / object / interface: выбирается для библиотечных целей
+target_type=object
+# none / vcpkg / conan
+package_manager=none
+```
+
+`toolchain_prefix` применяется к стандартным именам `gcc/g++/clang/clang++`; явный путь в `compiler` имеет преимущество. Префиксный компилятор должен реально существовать в `Pack` или `PATH`. При наличии выходного `.elf` и настроенного `objcopy` или префикса выполняется **постобработка через objcopy** с созданием соседних файлов `.bin` и `.hex`. PGR создаёт рядом с ними маркеры `.pgr_make_owner` и отказывается перезаписывать посторонние существующие `.bin`/`.hex`. В режиме собственного CMake эта операция работает после успешной сборки; для **чужого** CMake-проекта автоматическую постобработку PGR не применяет. Эта функция не прошивает устройство.
+
+Компилятор `cl.exe` из Visual Studio можно выбрать через пункт **31** TUI или установить `compiler=cl.exe` вручную. Нужен корректно инициализированный Visual Studio Developer Command Prompt. Для вызова `cl` в прямом режиме PGR использует аргументы семейства MSVC, не GNU-флаги. Для независимых статических конфигураций разных платформ рекомендуется CMake.
+
+`target_type=object` генерирует CMake `OBJECT` библиотеки вместо обычных статических; `target_type=interface` предназначен только для header-only библиотек. Для произвольных библиотечных зависимостей автоматическое разбиение проекта остаётся эвристическим: пользователь может предпочесть **32 (Сборка по исходному CMakeLists.txt)**. При `target_type=object/interface` прямой режим не преобразует тип цели: это настройка генератора CMake.
+
+Для vcpkg задайте `package_manager=vcpkg` и переменную среды `VCPKG_ROOT`, указывающую на установленный каталог. Для Conan 2 сначала выполните `conan install` (отдельно от PGR), затем задайте `package_manager=conan` и `toolchain_file` на созданный `conan_toolchain.cmake`. Настоящая установка пакетов выполняется вне PGR. Одновременное использование vcpkg и второго toolchain требует ручного chainloading и автоматически не настраивается.
+
+Во время автоматической генерации CMake создаётся `C:\PGR\Project\<name>\generated_cmake\CMakePresets.json` со своими configure/build preset `pgr-default`. Это **служебный** CMake source tree. Исходный `CMakePresets.json` пользовательского проекта никогда не заменяется. Также можно выполнить:
+
+```sh
+PGR_Make.exe --project Calculator --write-presets
+cd /c/PGR/Project/Calculator/generated_cmake
+cmake --preset pgr-default
+cmake --build --preset pgr-default
+```
+
+## 8. Структурированная диагностика и анализ
+
+После сборки вывод компилятора сохраняется в `work.log`, а распознанные записи записываются в `Project/<name>/diagnostics.json`. Они содержат `severity`, `category`, `file`, `line`, `column`, `code`, `message`, `tool`. Распознаются типичные ошибки GCC/Clang, MSVC (например C2065, LNK2019), сообщения линковщика и `clangd --check`; непонятные строки остаются только в исходном логе.
+
+```sh
+PGR_Make.exe --project Calculator --ci
+PGR_Make.exe --project Calculator --diagnostics
+PGR_Make.exe --project Calculator --analyze
+```
+
+Пункт TUI **33 (Диагностика)** показывает сообщения списком с местом в исходнике и может открыть выбранную позицию во внешнем VS Code (`code --goto`). Отчёт сохраняется между сеансами. Пункт **34 (Анализ clangd)** запускает проверки `clangd --check` по базе `compile_commands.json` из стандартного каталога CMake-сборки. Это не постоянный LSP-клиент: не предоставляются live-уведомления, перезапуск анализа происходит по команде пользователя. Пункт **35** вручную генерирует Presets, **36** задаёт префикс toolchain, **37** пакетный менеджер, **38** путь objcopy.
+
+Текущая схема проекта `C:\PGR` сохраняется. Для проверки обновлённого кода:
+
+```sh
+cmake -S . -B build-review -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-review
+ctest --test-dir build-review --output-on-failure
+python3 tests/run_tests.py build-review/PGR_Make
+python3 tests/run_features.py build-review/PGR_Make
+```
+
+Подробные границы архитектуры и статус реализации приведены в `ARCHITECTURE.md`.
+
+## Новое в версии 0.5: Pack Manager
+
+Управление и закрепление версий, проверка SHA-256, импорт ZIP, установка CMake/Ninja и GTK4-окно менеджера инструментов описаны в [PACK_MANAGER.md](PACK_MANAGER.md). Чтобы пользоваться встроенным каталогом и защищённой распаковкой в Windows, устанавливайте вместе с EXE каталог `tools/`, а также `Pack/catalog.json` (скрипты `build_windows.bat`, `install_to_c_pgr.bat` обновлены).

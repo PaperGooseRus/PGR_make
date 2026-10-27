@@ -26,8 +26,12 @@ class cmake_writer_t {
             const make_t::config_t& global)
         {
             std::map<std::string, std::string> result;
+            // All relative paths are rooted in the scanned project, NEVER in
+            // the PGR_Make process working directory (typically C:/PGR in GUI).
+            const auto source_root = std::filesystem::absolute(
+                std::filesystem::u8path(tree.root())).lexically_normal();
             for (const auto& item : layout.files())
-                result.emplace(item.first, render_file(item.second, layout, tree, global));
+                result.emplace(item.first, render_file(item.second, layout, tree, global, source_root));
             return result;
         }
 
@@ -106,11 +110,12 @@ class cmake_writer_t {
             }
             return out + '"';
         }
-        static std::string abs_path(const std::string& p) {
+        static std::string abs_path(const std::string& p,
+                                    const std::filesystem::path& source_root) {
             if (p.empty()) return {};
-            std::error_code ec;
-            auto result = std::filesystem::absolute(std::filesystem::u8path(p), ec);
-            return ec ? p : result.lexically_normal().generic_string();
+            auto input = std::filesystem::u8path(p);
+            const auto resolved = input.is_absolute() ? input : source_root / input;
+            return resolved.lexically_normal().generic_u8string();
         }
         static int write_files(const std::map<std::string, std::string>& files,
                                const std::filesystem::path& root) {
@@ -133,21 +138,23 @@ class cmake_writer_t {
         static std::string render_file(const cmake_layout_t::file_t& f,
                                        const cmake_layout_t& layout,
                                        const tree_t& tree,
-                                       const make_t::config_t& cfg) {
+                                       const make_t::config_t& cfg,
+                                       const std::filesystem::path& source_root) {
             std::string s;
             if (f.is_root) {
-                s += render_header(tree, layout, cfg);
-                s += render_globals(cfg);
+                s += render_header(tree, layout, cfg, source_root);
+                s += render_globals(cfg, source_root);
             }
             for (const auto& dir : f.subdirs) s += "add_subdirectory(" + q(dir) + ")\n";
             if (!f.subdirs.empty()) s += '\n';
             for (const auto& name : f.targets)
-                if (auto t = layout.target(name)) s += render_target(*t, cfg);
+                if (auto t = layout.target(name)) s += render_target(*t, cfg, source_root);
             return s;
         }
         static std::string render_header(const tree_t& tree,
                                          const cmake_layout_t& layout,
-                                         const make_t::config_t& cfg) {
+                                         const make_t::config_t& cfg,
+                                         const std::filesystem::path& source_root) {
             bool c = false, cpp = false;
             for (const auto& [_, t] : layout.targets()) for (const auto& src : t.sources) {
                 if (std::filesystem::path(src).extension() == ".c") c = true;
@@ -158,7 +165,7 @@ class cmake_writer_t {
             for (auto& ch : project) if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_') ch = '_';
             std::string s = "cmake_minimum_required(VERSION 3.16)\n";
             if (!cfg.toolchain_file.empty())
-                s += "set(CMAKE_TOOLCHAIN_FILE " + q(abs_path(cfg.toolchain_file)) + ")\n";
+                s += "set(CMAKE_TOOLCHAIN_FILE " + q(abs_path(cfg.toolchain_file, source_root)) + ")\n";
             s += "project(" + project + " LANGUAGES" + (c ? " C" : "") + (cpp ? " CXX" : "") + ")\n\n";
             std::string std_ver = "17";
             auto at = cfg.standard.find("=c++");
@@ -176,8 +183,15 @@ class cmake_writer_t {
             s += "set(CMAKE_EXPORT_COMPILE_COMMANDS ON)\n\n";
             return s;
         }
-        static std::string render_globals(const make_t::config_t& cfg) {
+        static std::string render_globals(const make_t::config_t& cfg,
+                                          const std::filesystem::path& source_root) {
             std::string s;
+            if (!cfg.package_dirs.empty()) {
+                s += "list(PREPEND CMAKE_PREFIX_PATH\n";
+                for (const auto& dir : cfg.package_dirs)
+                    s += "  " + q(abs_path(dir, source_root)) + "\n";
+                s += ")\n\n";
+            }
             for (const auto& pkg : cfg.packages) {
                 auto bar = pkg.find('|');
                 std::string name = pkg.substr(0, bar);
@@ -190,9 +204,9 @@ class cmake_writer_t {
             for (const auto& f : cfg.warnings) if (!f.empty()) flags.push_back(f);
             for (const auto& f : cfg.sanitizers) if (!f.empty()) flags.push_back(f);
             if (!flags.empty()) {
-                s += "add_compile_options(\n";
+                s += "if(NOT MSVC)\nadd_compile_options(\n";
                 for (const auto& f : flags) s += "  " + q(f) + "\n";
-                s += ")\n\n";
+                s += ")\nendif()\n\n";
             }
             if (!cfg.specific_gcc.empty() || !cfg.specific_clang.empty()) {
                 s += "add_compile_options(\n";
@@ -211,21 +225,21 @@ class cmake_writer_t {
             if (!cfg.lto.empty()) link_flags.push_back(cfg.lto);
             if (!cfg.linker_script.empty()) {
                 link_flags.push_back("-T");
-                link_flags.push_back(abs_path(cfg.linker_script));
+                link_flags.push_back(abs_path(cfg.linker_script, source_root));
             }
             if (!link_flags.empty()) {
-                s += "add_link_options(\n";
+                s += "if(NOT MSVC)\nadd_link_options(\n";
                 for (const auto& f : link_flags) if (!f.empty()) s += "  " + q(f) + "\n";
-                s += ")\n\n";
+                s += ")\nendif()\n\n";
             }
             if (!cfg.include_dirs.empty()) {
                 s += "include_directories(\n";
-                for (const auto& d : cfg.include_dirs) s += "  " + q(abs_path(d)) + "\n";
+                for (const auto& d : cfg.include_dirs) s += "  " + q(abs_path(d, source_root)) + "\n";
                 s += ")\n\n";
             }
             if (!cfg.library_dirs.empty()) {
                 s += "link_directories(\n";
-                for (const auto& d : cfg.library_dirs) s += "  " + q(abs_path(d)) + "\n";
+                for (const auto& d : cfg.library_dirs) s += "  " + q(abs_path(d, source_root)) + "\n";
                 s += ")\n\n";
             }
             std::vector<std::string> libs;
@@ -242,33 +256,39 @@ class cmake_writer_t {
             return s;
         }
         static std::string render_target(const target_t& t,
-                                         const make_t::config_t& cfg) {
+                                         const make_t::config_t& cfg,
+                                         const std::filesystem::path& source_root) {
             std::string s;
             auto n = q(t.name);
             auto kind = t.type;
-            if (kind == target_t::kind::static_lib && cfg.target_type == "shared")
-                kind = target_t::kind::shared_lib;
+            if (kind == target_t::kind::static_lib) {
+                if (cfg.target_type == "shared") kind = target_t::kind::shared_lib;
+                else if (cfg.target_type == "interface") kind = target_t::kind::interface_lib;
+            }
+            const bool object_lib = kind == target_t::kind::static_lib && cfg.target_type == "object";
             if (kind == target_t::kind::interface_lib) s += "add_library(" + n + " INTERFACE)\n";
             else {
                 std::string verb = kind == target_t::kind::executable ? "add_executable(" : "add_library(";
                 s += verb + n;
-                if (kind == target_t::kind::static_lib) s += " STATIC";
+                if (kind == target_t::kind::static_lib) s += object_lib ? " OBJECT" : " STATIC";
                 if (kind == target_t::kind::shared_lib) s += " SHARED";
-                for (const auto& source : t.sources) s += "\n  " + q(abs_path(source));
+                for (const auto& source : t.sources) s += "\n  " + q(abs_path(source, source_root));
                 s += "\n)\n";
             }
             if (kind == target_t::kind::executable && !cfg.output_file.empty()) {
-                auto path = std::filesystem::path(cfg.output_file);
-                auto stem = path.stem().string();
-                auto dirout = path.has_parent_path() ? abs_path(path.parent_path().string()) : "";
+                auto path = std::filesystem::u8path(cfg.output_file);
+                auto stem = path.stem().u8string();
+                auto dirout = path.has_parent_path() ? abs_path(path.parent_path().u8string(), source_root) : "";
                 if (!stem.empty()) s += "set_target_properties(" + n + " PROPERTIES OUTPUT_NAME " + q(stem) + ")\n";
+                if (path.extension() == ".elf")
+                    s += "set_target_properties(" + n + " PROPERTIES SUFFIX \".elf\")\n";
                 if (!dirout.empty()) s += "set_target_properties(" + n + " PROPERTIES RUNTIME_OUTPUT_DIRECTORY " + q(dirout) + ")\n";
             }
             auto scope = kind == target_t::kind::interface_lib ? " INTERFACE" : " PUBLIC";
             if (!t.public_include_dirs.empty() || !t.extra_includes.empty()) {
                 s += "target_include_directories(" + n + scope + "\n";
-                for (const auto& d : t.public_include_dirs) s += "  " + q(d.empty() ? abs_path(".") : abs_path(d)) + "\n";
-                for (const auto& d : t.extra_includes) s += "  " + q(abs_path(d)) + "\n";
+                for (const auto& d : t.public_include_dirs) s += "  " + q(d.empty() ? abs_path(".", source_root) : abs_path(d, source_root)) + "\n";
+                for (const auto& d : t.extra_includes) s += "  " + q(abs_path(d, source_root)) + "\n";
                 s += ")\n";
             }
             if (!t.extra_flags.empty()) {

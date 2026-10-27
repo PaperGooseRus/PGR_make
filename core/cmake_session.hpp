@@ -11,6 +11,7 @@
 #include "cmake_layout.hpp"
 #include "cmake_writer.hpp"
 #include "toolchain.hpp"
+#include "presets.hpp"
 
 namespace pgr_cmake {
 namespace fs = std::filesystem;
@@ -31,6 +32,9 @@ inline bool generate(const pgr_workspace::project_t& project,
     if (cmake_writer_t::save_staged(tree, layout, config, project.stage()) != 0) {
         error = "cannot generate staged CMakeLists"; return false;
     }
+    // Staging regeneration replaces the whole PGR-owned directory.
+    // Recreate presets each time so they cannot silently disappear.
+    if (!pgr_presets::write(project, config, error)) return false;
     return true;
 }
 
@@ -41,7 +45,8 @@ inline bool prepare_cache(const pgr_workspace::project_t& project, const fs::pat
                           bool native = false) {
     if (!pgr_paths::prepare(target, project.source_root, project.store_root, error)) return false;
     const std::string key = "PGR_CMAKE_CACHE_V1\n" + config.compiler + "\n" +
-        config.toolchain_file + "\n" + (native ? "native" : "generated") + "\n";
+        config.toolchain_file + "\n" + config.toolchain_prefix + "\n" +
+        config.package_manager + "\n" + (native ? "native" : "generated") + "\n";
     const fs::path key_file = target / ".pgr_make_cache_key";
     if (fs::exists(target / "CMakeCache.txt")) {
         std::ifstream old(key_file, std::ios::binary);

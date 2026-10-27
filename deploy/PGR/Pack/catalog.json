@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "packages": [
+    {
+      "id": "cmake@4.4.4@windows-x86_64",
+      "tool": "cmake", "version": "4.4.4", "platform": "windows-x86_64",
+      "url": "https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip",
+      "sha256": "bace36e94b31c68ab6fa295f26dfa11219e0701cf7c94b0284a7d1cb13dac536",
+      "executable": "bin/cmake.exe"
+    },
+    {
+      "id": "ninja@1.13.1@windows-x86_64",
+      "tool": "ninja", "version": "1.13.1", "platform": "windows-x86_64",
+      "url": "https://github.com/ninja-build/ninja/releases/download/v1.13.1/ninja-win.zip",
+      "sha256": "26a40fa8595694dec2fad4911e62d29e10525d2133c9a4230b66397774ae25bf",
+      "executable": "ninja.exe"
+    }
+  ]
+}
