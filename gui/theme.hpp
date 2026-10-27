@@ -105,7 +105,7 @@ label { color: @pgr_text; }
     font-size: 11px;
 }
 .pgr-accent { color: @pgr_accent; }
-button {
+.pgr-app button {
     color: @pgr_text;
     background-image: none;
     background-color: @pgr_panel;
@@ -114,32 +114,49 @@ button {
     padding: 7px 11px;
     box-shadow: none;
 }
-button:hover { background-color: @pgr_hover; }
-button:active { background-color: @pgr_input; }
-button:disabled { opacity: 0.5; }
-button:focus-visible, entry:focus-within, dropdown:focus-within {
+.pgr-app button:hover { background-color: @pgr_hover; }
+.pgr-app button:active { background-color: @pgr_input; }
+.pgr-app button:disabled { opacity: 0.5; }
+.pgr-app button:focus-visible, .pgr-app entry:focus-within, .pgr-app dropdown:focus-within {
     outline: 2px solid @pgr_accent;
     outline-offset: 1px;
 }
-button.suggested-action, button.pgr-build {
+.pgr-app button.suggested-action, .pgr-app button.pgr-build {
     color: @pgr_accent_text;
     background-image: none;
     background-color: @pgr_accent;
     border-color: @pgr_accent;
     font-weight: 750;
 }
-button.suggested-action:hover, button.pgr-build:hover {
+.pgr-app button.suggested-action:hover, .pgr-app button.pgr-build:hover {
     background-color: @pgr_accent_hover;
     border-color: @pgr_accent_hover;
 }
-button.destructive-action {
+.pgr-app button.destructive-action, dialog button.destructive-action {
     background-image: none;
     background-color: @pgr_panel;
     border: 1px solid @pgr_error;
     color: @pgr_error;
 }
-button.pgr-stop { border-color: @pgr_accent; }
-entry, searchentry, dropdown, spinbutton {
+.pgr-app button.pgr-stop { border-color: @pgr_accent; }
+/* Native GtkWindow title controls must not inherit padding and the large
+ * touch-target style of regular workspace buttons. GTK4 uses the CSS node
+ * `windowcontrols` for minimize/maximize/close buttons. */
+headerbar windowcontrols button, windowcontrols button {
+    min-width: 24px;
+    min-height: 24px;
+    padding: 0;
+    margin: 0 1px;
+    border: 0;
+    border-radius: 5px;
+    background-image: none;
+    background-color: transparent;
+    box-shadow: none;
+}
+windowcontrols button image { -gtk-icon-size: 12px; }
+windowcontrols button:hover { background-color: @pgr_hover; }
+windowcontrols button.close:hover { background-color: @pgr_error; color: @pgr_accent_text; }
+entry, searchentry, dropdown, spin.pgr-app button {
     background-color: @pgr_input;
     background-image: none;
     color: @pgr_text;
@@ -195,6 +212,18 @@ scrolledwindow.pgr-log-area {
 .pgr-diagnostic-error { border-left: 2px solid @pgr_error; }
 .pgr-diagnostic-warning { border-left: 2px solid @pgr_accent; }
 .pgr-unavailable { color: @pgr_muted; }
+.pgr-output-panel {
+    background-color: @pgr_sidebar;
+    border: 1px solid @pgr_border;
+    border-radius: 10px;
+    padding: 8px 12px;
+}
+.pgr-output-toolbar {
+    padding: 2px 3px;
+    min-height: 34px;
+}
+.pgr-output-toolbar searchentry { min-width: 150px; }
+.pgr-output-panel notebook { border-radius: 6px; }
 .pgr-results {
     border: 1px solid @pgr_border;
     border-radius: 10px;
@@ -219,8 +248,14 @@ notebook header tabs tab:hover { background-color: @pgr_hover; }
 checkbutton { color: @pgr_text; }
 checkbutton check:checked { background-color: @pgr_accent; color: @pgr_accent_text; }
 .pgr-app separator { background-color: @pgr_border; }
-.pgr-app paned > separator { background-color: @pgr_border; min-width: 4px; }
+.pgr-app paned > separator {
+    background-color: @pgr_border;
+    min-width: 5px;
+    min-height: 5px;
+    border-radius: 2px;
+}
 .pgr-app paned > separator:hover { background-color: @pgr_accent; }
+.pgr-app paned.pgr-vertical-paned > separator { min-height: 7px; }
 )PGR_CSS";
 
 /** @brief Produce the complete stylesheet for a chosen appearance. */

@@ -5,6 +5,7 @@
  */
 #include <gtk/gtk.h>
 #include "theme.hpp"
+#include "layout_settings.hpp"
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -40,6 +41,7 @@ struct Choice {
 struct Gui {
     explicit Gui(fs::path root) : registry(std::move(root)) {
         catalog.load_builtin();
+        layout = pgr_gui_layout::read(registry.projects_root() / ".pgr_gui_layout");
         std::ifstream stored_theme(registry.projects_root() / ".pgr_gui_theme");
         std::string value;
         if (stored_theme && std::getline(stored_theme, value)) dark_theme = value != "light";
@@ -62,6 +64,16 @@ struct Gui {
     bool dirty = false;
     bool busy = false;
     bool dark_theme = true;
+    pgr_gui_layout::settings layout;
+    bool restoring_layout = true;
+    guint layout_save_source = 0;
+    int regular_split = 565;
+    bool output_expanded = false;
+    GtkWidget *vertical_paned = nullptr, *horizontal_paned = nullptr;
+    GtkWidget *output_panel = nullptr, *output_toggle = nullptr, *output_expand = nullptr;
+    GtkWidget *log_search = nullptr, *search_status = nullptr, *autoscroll_button = nullptr;
+    GtkWidget *settings_search = nullptr, *category_select = nullptr;
+    GtkTextTag* search_tag = nullptr;
     GtkCssProvider* theme_provider = nullptr;
     GtkWidget* theme_button = nullptr;
     GtkWidget* active_project_label = nullptr;
@@ -139,7 +151,8 @@ static void log_line(Gui* ui, const std::string& s) {
         gtk_text_buffer_delete(ui->log_buffer, &a, &b);
     }
     gtk_text_buffer_get_end_iter(ui->log_buffer, &end);
-    gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(ui->log_view), &end, 0., FALSE, 0., 1.);
+    if (ui->layout.autoscroll)
+        gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(ui->log_view), &end, 0., FALSE, 0., 1.);
 }
 static void set_busy(Gui* ui, bool busy) {
     gtk_widget_set_sensitive(ui->left_controls, !busy && !ui->selected.name.empty());
@@ -163,6 +176,140 @@ static void show_history(Gui* ui);
 static bool save_settings(Gui* ui);
 static void load_project(Gui* ui, const project_t& project);
 static void refresh_projects(Gui* ui, const std::string& preferred = {});
+// Restore/save the two splitter positions and output behavior independently of the project.
+static void save_layout_now(Gui* ui) {
+    if (ui->restoring_layout || !ui->window) return;
+    const int width = gtk_widget_get_width(ui->window);
+    const int height = gtk_widget_get_height(ui->window);
+    if (width >= 940) ui->layout.window_width = std::min(width, 3840);
+    if (height >= 620) ui->layout.window_height = std::min(height, 2160);
+    if (ui->horizontal_paned) {
+        const int position = gtk_paned_get_position(GTK_PANED(ui->horizontal_paned));
+        if (position >= 600) ui->layout.projects_split = position;
+    }
+    if (ui->vertical_paned && ui->layout.output_visible && !ui->output_expanded) {
+        const int position = gtk_paned_get_position(GTK_PANED(ui->vertical_paned));
+        if (position >= 280) ui->layout.output_split = position;
+    }
+    if (ui->results) ui->layout.output_page = gtk_notebook_get_current_page(GTK_NOTEBOOK(ui->results));
+    if (ui->category_select)
+        ui->layout.category = static_cast<int>(gtk_drop_down_get_selected(GTK_DROP_DOWN(ui->category_select)));
+    pgr_gui_layout::write(ui->registry.projects_root() / ".pgr_gui_layout", ui->layout);
+}
+static gboolean save_layout_timeout(gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    ui->layout_save_source = 0;
+    save_layout_now(ui);
+    return G_SOURCE_REMOVE;
+}
+static void schedule_layout_save(Gui* ui) {
+    if (ui->restoring_layout) return;
+    if (ui->layout_save_source) g_source_remove(ui->layout_save_source);
+    ui->layout_save_source = g_timeout_add(450, save_layout_timeout, ui);
+}
+static void on_split_position(GObject*, GParamSpec*, gpointer payload) {
+    schedule_layout_save(static_cast<Gui*>(payload));
+}
+static void on_output_page(GtkNotebook*, GtkWidget*, guint, gpointer payload) {
+    schedule_layout_save(static_cast<Gui*>(payload));
+}
+static void toggle_output(GtkButton*, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    if (!ui->output_panel) return;
+    if (ui->layout.output_visible && ui->output_expanded) {
+        ui->output_expanded = false;
+        if (ui->output_expand)
+            gtk_button_set_label(GTK_BUTTON(ui->output_expand), "Развернуть");
+    }
+    ui->layout.output_visible = !ui->layout.output_visible;
+    gtk_widget_set_visible(ui->output_panel, ui->layout.output_visible);
+    if (ui->output_toggle)
+        gtk_button_set_label(GTK_BUTTON(ui->output_toggle),
+                             ui->layout.output_visible ? "▾ Вывод" : "▸ Вывод");
+    if (ui->layout.output_visible && ui->vertical_paned)
+        gtk_paned_set_position(GTK_PANED(ui->vertical_paned), ui->layout.output_split);
+    schedule_layout_save(ui);
+}
+static void expand_output(GtkButton*, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    if (!ui->vertical_paned) return;
+    if (!ui->layout.output_visible) toggle_output(nullptr, ui);
+    if (ui->output_expanded) {
+        ui->output_expanded = false;
+        gtk_paned_set_position(GTK_PANED(ui->vertical_paned), ui->regular_split);
+    } else {
+        ui->regular_split = gtk_paned_get_position(GTK_PANED(ui->vertical_paned));
+        if (ui->regular_split < 280) ui->regular_split = ui->layout.output_split;
+        ui->output_expanded = true;
+        gtk_paned_set_position(GTK_PANED(ui->vertical_paned), 280);
+    }
+    gtk_button_set_label(GTK_BUTTON(ui->output_expand),
+                         ui->output_expanded ? "Восстановить" : "Развернуть");
+    schedule_layout_save(ui);
+}
+static void on_autoscroll(GtkCheckButton* check, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    ui->layout.autoscroll = gtk_check_button_get_active(check);
+    schedule_layout_save(ui);
+}
+static void on_log_search(GtkEditable* editable, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    if (!ui->log_buffer || !ui->search_tag) return;
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(ui->log_buffer, &start, &end);
+    gtk_text_buffer_remove_tag(ui->log_buffer, ui->search_tag, &start, &end);
+    const char* phrase = gtk_editable_get_text(editable);
+    if (!phrase || !*phrase) {
+        if (ui->search_status) gtk_label_set_text(GTK_LABEL(ui->search_status), "");
+        return;
+    }
+    int matches = 0;
+    GtkTextIter current = start, first, last;
+    while (matches < 300 && gtk_text_iter_forward_search(&current, phrase,
+           GTK_TEXT_SEARCH_CASE_INSENSITIVE, &first, &last, nullptr)) {
+        gtk_text_buffer_apply_tag(ui->log_buffer, ui->search_tag, &first, &last);
+        if (matches == 0) gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(ui->log_view), &first, 0., FALSE, 0., 0.);
+        current = last;
+        ++matches;
+    }
+    if (ui->search_status) {
+        const std::string count = std::to_string(matches) + (matches == 300 ? "+ совпадений" : " совпадений");
+        gtk_label_set_text(GTK_LABEL(ui->search_status), count.c_str());
+    }
+}
+static void clear_log(GtkButton*, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    gtk_text_buffer_set_text(ui->log_buffer, "", -1);
+    if (ui->search_status) gtk_label_set_text(GTK_LABEL(ui->search_status), "");
+}
+static void copy_log(GtkButton*, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(ui->log_buffer, &start, &end);
+    gchar* content = gtk_text_buffer_get_text(ui->log_buffer, &start, &end, FALSE);
+    GdkClipboard* clipboard = gtk_widget_get_clipboard(ui->window);
+    gdk_clipboard_set_text(clipboard, content ? content : "");
+    g_free(content);
+    set_status(ui, "Журнал скопирован в буфер обмена");
+}
+static void primary_build(GtkButton*, gpointer);
+static gboolean on_global_key(GtkEventControllerKey*, guint keyval, guint,
+                              GdkModifierType modifiers, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    if (!(modifiers & GDK_CONTROL_MASK)) return FALSE;
+    switch (gdk_keyval_to_lower(keyval)) {
+        case GDK_KEY_b: primary_build(nullptr, ui); return TRUE;
+        case GDK_KEY_s: if (!ui->busy) save_settings(ui); return TRUE;
+        case GDK_KEY_j: toggle_output(nullptr, ui); return TRUE;
+        case GDK_KEY_f:
+            if (!ui->layout.output_visible) toggle_output(nullptr, ui);
+            gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results), 0);
+            gtk_widget_grab_focus(ui->log_search);
+            return TRUE;
+        default: return FALSE;
+    }
+}
+
 static void mark_dirty(Gui* ui) {
     if (ui->loading || ui->selected.name.empty()) return;
     ui->dirty = true;
@@ -1058,20 +1205,53 @@ static void search_projects_changed(GtkEditable*,gpointer data) {
     auto* ui=static_cast<Gui*>(data);
     gtk_list_box_invalidate_filter(GTK_LIST_BOX(ui->project_list));
 }
-static void settings_search_changed(GtkEditable* input,gpointer data) {
-    auto* ui=static_cast<Gui*>(data);
-    gchar* query=g_utf8_casefold(gtk_editable_get_text(input),-1);
-    for (GtkWidget* child=gtk_widget_get_first_child(ui->settings_form);child;
-         child=gtk_widget_get_next_sibling(child)) {
-        const char* caption=GTK_IS_EXPANDER(child)?gtk_expander_get_label(GTK_EXPANDER(child)):"";
-        gchar* lowered=g_utf8_casefold(caption?caption:"",-1);
-        const bool matches=!*query || strstr(lowered,query)!=nullptr;
-        gtk_widget_set_visible(child,matches);
-        if (*query && matches && GTK_IS_EXPANDER(child))
-            gtk_expander_set_expanded(GTK_EXPANDER(child),TRUE);
+// Search across labels inside a section, not only its heading. This keeps
+// seldom-used flags discoverable without requiring users to know their group.
+static bool contains_label(GtkWidget* widget, const char* query, int depth = 0) {
+    if (!widget || depth > 18) return false;
+    if (GTK_IS_LABEL(widget)) {
+        gchar* text = g_utf8_casefold(gtk_label_get_text(GTK_LABEL(widget)), -1);
+        const bool matches = text && strstr(text, query) != nullptr;
+        g_free(text);
+        if (matches) return true;
+    }
+    for (GtkWidget* child = gtk_widget_get_first_child(widget); child;
+         child = gtk_widget_get_next_sibling(child)) {
+        if (contains_label(child, query, depth + 1)) return true;
+    }
+    return false;
+}
+static void update_settings_filter(Gui* ui) {
+    const char* current = ui->settings_search ?
+        gtk_editable_get_text(GTK_EDITABLE(ui->settings_search)) : "";
+    gchar* query = g_utf8_casefold(current, -1);
+    const guint category = ui->category_select ?
+        gtk_drop_down_get_selected(GTK_DROP_DOWN(ui->category_select)) : 0;
+    int section_index = 0;
+    for (GtkWidget* child = gtk_widget_get_first_child(ui->settings_form); child;
+         child = gtk_widget_get_next_sibling(child), ++section_index) {
+        const char* caption = GTK_IS_EXPANDER(child) ? gtk_expander_get_label(GTK_EXPANDER(child)) : "";
+        gchar* lowered = g_utf8_casefold(caption ? caption : "", -1);
+        // Actual source section order: general, versions, flags, paths, cmake, actions.
+        const guint section_category[] = {1, 5, 2, 3, 4, 6};
+        const bool group_ok = category == 0 ||
+            (section_index < 6 && category == section_category[section_index]);
+        const bool matches = !*query || strstr(lowered, query) != nullptr ||
+                             contains_label(child, query);
+        gtk_widget_set_visible(child, group_ok && matches);
+        if (((*query && matches) || category != 0) && group_ok && GTK_IS_EXPANDER(child))
+            gtk_expander_set_expanded(GTK_EXPANDER(child), TRUE);
         g_free(lowered);
     }
     g_free(query);
+}
+static void settings_search_changed(GtkEditable*, gpointer payload) {
+    update_settings_filter(static_cast<Gui*>(payload));
+}
+static void category_changed(GObject*, GParamSpec*, gpointer payload) {
+    auto* ui = static_cast<Gui*>(payload);
+    update_settings_filter(ui);
+    schedule_layout_save(ui);
 }
 static void primary_build(GtkButton*,gpointer data) {
     auto* ui=static_cast<Gui*>(data);
@@ -1404,13 +1584,25 @@ static gboolean on_close_request(GtkWindow*,gpointer payload) {
         // Explicit close via the window manager does not auto-write config.
         return TRUE;
     }
+    if (ui->layout_save_source) {
+        g_source_remove(ui->layout_save_source);
+        ui->layout_save_source = 0;
+    }
+    save_layout_now(ui);
     return FALSE;
 }
 static void activate(GtkApplication* app, gpointer payload) {
     auto* ui = static_cast<Gui*>(payload);
     ui->window = gtk_application_window_new(app);
     gtk_window_set_title(GTK_WINDOW(ui->window), "PGR_Make · Build Workspace");
-    gtk_window_set_default_size(GTK_WINDOW(ui->window), 1380, 880);
+    gtk_window_set_default_size(GTK_WINDOW(ui->window),
+                                ui->layout.window_width, ui->layout.window_height);
+    // Keep the platform's native CSD controls; CSS rules for application buttons
+    // do not apply to system minimize/maximize/close buttons.
+    GtkEventController* keyboard = gtk_event_controller_key_new();
+    gtk_event_controller_set_propagation_phase(keyboard, GTK_PHASE_CAPTURE);
+    g_signal_connect(keyboard, "key-pressed", G_CALLBACK(on_global_key), ui);
+    gtk_widget_add_controller(ui->window, keyboard);
     gtk_widget_add_css_class(ui->window, "pgr-window");
     ui->theme_provider = gtk_css_provider_new();
     gtk_style_context_add_provider_for_display(
@@ -1456,13 +1648,26 @@ static void activate(GtkApplication* app, gpointer payload) {
 
     // Required orientation: LEFT contains all TUI settings/commands;
     // RIGHT contains the selectable project list.
+    // Nested GtkPaned: horizontal configuration/projects above a full-width,
+    // vertically resizable output area. Neither splitter depends on project state.
+    GtkWidget* vertical = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    ui->vertical_paned = vertical;
+    gtk_widget_set_hexpand(vertical, TRUE);
+    gtk_widget_set_vexpand(vertical, TRUE);
+    gtk_paned_set_wide_handle(GTK_PANED(vertical), TRUE);
+    gtk_widget_add_css_class(vertical, "pgr-vertical-paned");
+    gtk_box_append(GTK_BOX(root), vertical);
     GtkWidget* paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    ui->horizontal_paned = paned;
     gtk_widget_set_hexpand(paned, TRUE);
     gtk_widget_set_vexpand(paned, TRUE);
     gtk_paned_set_wide_handle(GTK_PANED(paned), TRUE);
-    gtk_paned_set_position(GTK_PANED(paned), 990);
+    gtk_paned_set_position(GTK_PANED(paned), ui->layout.projects_split);
     gtk_widget_add_css_class(paned, "pgr-workspace");
-    gtk_box_append(GTK_BOX(root), paned);
+    gtk_paned_set_start_child(GTK_PANED(vertical), paned);
+    gtk_paned_set_position(GTK_PANED(vertical), ui->layout.output_split);
+    g_signal_connect(vertical, "notify::position", G_CALLBACK(on_split_position), ui);
+    g_signal_connect(paned, "notify::position", G_CALLBACK(on_split_position), ui);
 
     GtkWidget* left = column(12);
     gtk_widget_add_css_class(left, "pgr-main");
@@ -1489,7 +1694,14 @@ static void activate(GtkApplication* app, gpointer payload) {
     ui->quick_actions.push_back(action(ui, top_commands, "Сохранить", "save"));
     ui->stop_button = action(ui, top_commands, "■ Стоп", "stop");
     gtk_widget_add_css_class(ui->stop_button, "pgr-stop");
-    gtk_box_append(GTK_BOX(left), top_commands);
+    GtkWidget* toggle = gtk_button_new_with_label(ui->layout.output_visible ? "▾ Вывод" : "▸ Вывод");
+    ui->output_toggle = toggle;
+    gtk_widget_set_tooltip_text(toggle, "Показать/скрыть нижнюю панель (Ctrl+J)");
+    g_signal_connect(toggle, "clicked", G_CALLBACK(toggle_output), ui);
+    gtk_box_append(GTK_BOX(top_commands), toggle);
+    // Global toolbar is independent of the two workspace panes.
+    gtk_box_insert_child_after(GTK_BOX(root), top_commands,
+                               gtk_widget_get_first_child(root));
 
     GtkWidget* controls = gtk_scrolled_window_new();
     gtk_widget_set_vexpand(controls, TRUE);
@@ -1498,11 +1710,19 @@ static void activate(GtkApplication* app, gpointer payload) {
     GtkWidget* form = column(8);
     margins(form, 8);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(controls), form);
-    GtkWidget* settings_search=gtk_search_entry_new();
-    gtk_widget_set_hexpand(settings_search,TRUE);
-    g_object_set(G_OBJECT(settings_search),"placeholder-text","Найти раздел: компилятор, флаги, пути, CMake…",nullptr);
-    gtk_box_append(GTK_BOX(left),settings_search);
-    g_signal_connect(settings_search,"changed",G_CALLBACK(settings_search_changed),ui);
+    GtkWidget* settings_header = row(8);
+    const char* groups[] = {"Все настройки", "Основные", "Флаги", "Пути", "CMake", "Инструменты", "Команды", nullptr};
+    ui->category_select = gtk_drop_down_new_from_strings(groups);
+    gtk_widget_set_size_request(ui->category_select, 165, -1);
+    gtk_drop_down_set_selected(GTK_DROP_DOWN(ui->category_select), static_cast<guint>(ui->layout.category));
+    gtk_box_append(GTK_BOX(settings_header), ui->category_select);
+    ui->settings_search = gtk_search_entry_new();
+    gtk_widget_set_hexpand(ui->settings_search, TRUE);
+    g_object_set(G_OBJECT(ui->settings_search), "placeholder-text", "Поиск настроек…", nullptr);
+    gtk_box_append(GTK_BOX(settings_header), ui->settings_search);
+    gtk_box_append(GTK_BOX(left), settings_header);
+    g_signal_connect(ui->settings_search, "changed", G_CALLBACK(settings_search_changed), ui);
+    g_signal_connect(ui->category_select, "notify::selected", G_CALLBACK(category_changed), ui);
     gtk_box_append(GTK_BOX(left), controls);
     ui->settings_form=form;
     build_configuration_form(ui, form);
@@ -1510,15 +1730,51 @@ static void activate(GtkApplication* app, gpointer payload) {
     g_signal_connect(ui->singles.at("profile").dropdown, "notify::selected",
                      G_CALLBACK(on_profile_changed), ui);
 
+    GtkWidget* output = column(7);
+    ui->output_panel = output;
+    gtk_widget_set_size_request(output, -1, 145);
+    gtk_widget_add_css_class(output, "pgr-output-panel");
+    GtkWidget* output_toolbar = row(10);
+    gtk_widget_add_css_class(output_toolbar, "pgr-output-toolbar");
+    GtkWidget* output_title = label("РЕЗУЛЬТАТЫ СБОРКИ");
+    gtk_widget_add_css_class(output_title, "pgr-panel-title");
+    gtk_box_append(GTK_BOX(output_toolbar), output_title);
+    ui->log_search = gtk_search_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ui->log_search), "Поиск в журнале · Ctrl+F");
+    gtk_widget_set_hexpand(ui->log_search, TRUE);
+    gtk_box_append(GTK_BOX(output_toolbar), ui->log_search);
+    ui->search_status = label("");
+    gtk_widget_add_css_class(ui->search_status, "pgr-meta");
+    gtk_box_append(GTK_BOX(output_toolbar), ui->search_status);
+    ui->autoscroll_button = gtk_check_button_new_with_label("Автопрокрутка");
+    gtk_check_button_set_active(GTK_CHECK_BUTTON(ui->autoscroll_button), ui->layout.autoscroll);
+    g_signal_connect(ui->autoscroll_button, "toggled", G_CALLBACK(on_autoscroll), ui);
+    gtk_box_append(GTK_BOX(output_toolbar), ui->autoscroll_button);
+    GtkWidget* copy_all = gtk_button_new_with_label("Копировать");
+    g_signal_connect(copy_all, "clicked", G_CALLBACK(copy_log), ui);
+    gtk_box_append(GTK_BOX(output_toolbar), copy_all);
+    GtkWidget* clear = gtk_button_new_with_label("Очистить");
+    gtk_widget_set_tooltip_text(clear, "Очистить только видимое содержимое журнала");
+    g_signal_connect(clear, "clicked", G_CALLBACK(clear_log), ui);
+    gtk_box_append(GTK_BOX(output_toolbar), clear);
+    ui->output_expand = gtk_button_new_with_label("Развернуть");
+    g_signal_connect(ui->output_expand, "clicked", G_CALLBACK(expand_output), ui);
+    gtk_box_append(GTK_BOX(output_toolbar), ui->output_expand);
+    gtk_box_append(GTK_BOX(output), output_toolbar);
     ui->results = gtk_notebook_new();
-    gtk_widget_set_size_request(ui->results, -1, 260);
+    gtk_widget_set_vexpand(ui->results, TRUE);
     gtk_widget_add_css_class(ui->results, "pgr-results");
+    g_signal_connect(ui->results, "switch-page", G_CALLBACK(on_output_page), ui);
     ui->log_view = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(ui->log_view), FALSE);
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(ui->log_view), TRUE);
     gtk_widget_add_css_class(ui->log_view, "pgr-log");
     gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(ui->log_view), GTK_WRAP_WORD_CHAR);
     ui->log_buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(ui->log_view));
+    ui->search_tag = gtk_text_buffer_create_tag(ui->log_buffer, "pgr-match-highlight",
+                                                 "background", "#D97757",
+                                                 "foreground", "#141413", nullptr);
+    g_signal_connect(ui->log_search, "changed", G_CALLBACK(on_log_search), ui);
     GtkWidget* logs_scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(logs_scroll), ui->log_view);
     gtk_widget_add_css_class(logs_scroll, "pgr-log-area");
@@ -1554,7 +1810,10 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_text_view_set_monospace(GTK_TEXT_VIEW(ui->history_view),TRUE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(history_scroller),ui->history_view);
     gtk_notebook_append_page(GTK_NOTEBOOK(ui->results),history_scroller,gtk_label_new("История"));
-    gtk_box_append(GTK_BOX(left), ui->results);
+    gtk_box_append(GTK_BOX(output), ui->results);
+    gtk_paned_set_end_child(GTK_PANED(vertical), output);
+    gtk_widget_set_visible(output, ui->layout.output_visible);
+    gtk_notebook_set_current_page(GTK_NOTEBOOK(ui->results), ui->layout.output_page);
 
     GtkWidget* right = column(10);
     gtk_widget_add_css_class(right, "pgr-sidebar");
@@ -1622,9 +1881,11 @@ static void activate(GtkApplication* app, gpointer payload) {
     gtk_box_append(GTK_BOX(footer), ui->status);
     gtk_box_append(GTK_BOX(footer), label("PGR · C++17 / GTK4"));
     gtk_box_append(GTK_BOX(root), footer);
+    update_settings_filter(ui);
     refresh_projects(ui);
-    log_line(ui, "PGR_Make GTK4: слева настройки и команды, справа проекты.");
+    log_line(ui, "PGR_Make GTK4: рабочая область и журнал разделены двумя GtkPaned.");
     gtk_window_present(GTK_WINDOW(ui->window));
+    ui->restoring_layout = false;
 }
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
@@ -1636,6 +1897,10 @@ int main(int argc, char** argv) {
     GtkApplication* app = gtk_application_new("com.pgr.make", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), &ui);
     const int result = g_application_run(G_APPLICATION(app), 0, nullptr);
+    if (ui.layout_save_source) {
+        g_source_remove(ui.layout_save_source);
+        ui.layout_save_source = 0;
+    }
     ui.cancellation.cancel();
     if (ui.worker.joinable()) ui.worker.join();
     if (ui.theme_provider) {
