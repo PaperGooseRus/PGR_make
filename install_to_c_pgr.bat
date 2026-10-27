@@ -25,6 +25,9 @@ REM Managed catalog is installed only if absent; never overwrite custom manifest
 if not exist "C:\PGR\tools" mkdir "C:\PGR\tools"
 copy /Y "deploy\PGR\tools\zip_guard.ps1" "C:\PGR\tools\zip_guard.ps1" >nul
 copy /Y "deploy\PGR\tools\zip_guard.py" "C:\PGR\tools\zip_guard.py" >nul
+REM The shipped catalog is updated with the application; custom Pack/catalog.json stays untouched.
+copy /Y "deploy\PGR\tools\catalog.json" "C:\PGR\tools\catalog.json" >nul
+if errorlevel 1 (echo ERROR: Could not update trusted tools catalog. & popd & exit /b 1)
 if not exist "C:\PGR\Pack\catalog.json" copy "deploy\PGR\Pack\catalog.json" "C:\PGR\Pack\catalog.json" >nul
 echo Installed CLI and GUI in C:\PGR\ (GTK4 runtime required).
 REM Intentionally NEVER overwrite Pack tools or Project configurations.

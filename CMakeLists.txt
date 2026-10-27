@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(PGR_Make VERSION 0.8.0 LANGUAGES CXX)
+project(PGR_Make VERSION 0.8.1 LANGUAGES CXX)
 
 option(PGR_ENABLE_SANITIZERS "Enable ASan/UBSan on GCC or Clang (Linux CI)" OFF)
 if(PGR_ENABLE_SANITIZERS)
@@ -106,7 +106,7 @@ if(BUILD_TESTING)
     endif()
     # Independent unit suites for modules that previously had no direct tests.
     # They are included in CTest so failures block a release, not just printed.
-    foreach(module hash json paths pack_schema config tool_resolution toolchain presets project_setup)
+    foreach(module hash json paths pack_schema pack_bulk config tool_resolution toolchain presets project_setup)
         add_executable(pgr_unit_${module} tests/units/test_${module}.cpp)
         target_link_libraries(pgr_unit_${module} PRIVATE core)
         add_test(NAME unit_${module} COMMAND pgr_unit_${module})
@@ -114,7 +114,7 @@ if(BUILD_TESTING)
     endforeach()
     # These old and new tests use assertions: ensure they remain active under -DNDEBUG.
     foreach(unit pgr_unit_hash pgr_unit_json pgr_unit_paths
-                 pgr_unit_pack_schema pgr_unit_config pgr_unit_tool_resolution
+                 pgr_unit_pack_schema pgr_unit_pack_bulk pgr_unit_config pgr_unit_tool_resolution
                  pgr_unit_toolchain pgr_unit_presets pgr_unit_project_setup)
         if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
             target_compile_options(${unit} PRIVATE -UNDEBUG)
@@ -140,9 +140,13 @@ if(BUILD_TESTING)
         add_test(NAME gui_theme_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gui_theme.py)
         add_test(NAME gui_v06_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gui_v06.py)
         add_test(NAME gui_v07_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gui_v07.py)
+        add_test(NAME gui_pack_bulk_contract COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_gui_pack_bulk.py)
         # The legacy ZIP fixture uses POSIX shell wrappers; Windows gets its own
         # native Ninja ZIP/PowerShell importer test instead.
         if(NOT WIN32)
+            add_test(NAME pack_bundle_acceptance COMMAND ${Python3_EXECUTABLE}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pack_bulk_install.py $<TARGET_FILE:app>)
+            set_tests_properties(pack_bundle_acceptance PROPERTIES LABELS "integration;acceptance" TIMEOUT 120)
             add_test(NAME pack_manager_regression COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_pack_manager.py $<TARGET_FILE:app>)
             set_tests_properties(pack_manager_regression PROPERTIES TIMEOUT 120)
         endif()
@@ -152,7 +156,7 @@ if(BUILD_TESTING)
         if(NOT WIN32)
             set_tests_properties(pack_manager_regression PROPERTIES LABELS "integration;cli")
         endif()
-        foreach(t gui_surface_contract gui_theme_contract gui_v06_contract gui_v07_contract)
+        foreach(t gui_surface_contract gui_theme_contract gui_v06_contract gui_v07_contract gui_pack_bulk_contract)
             set_tests_properties(${t} PROPERTIES LABELS "contract;gui")
         endforeach()
         add_test(NAME acceptance_matrix COMMAND ${Python3_EXECUTABLE}

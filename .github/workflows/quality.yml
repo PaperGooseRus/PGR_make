@@ -95,8 +95,8 @@ jobs:
           mkdir -p stage/PGR/Pack stage/PGR/Project stage/PGR/tools stage/PGR/docs
           cp build-ci/PGR_Make.exe build-ci/PGR_Make_GUI.exe stage/PGR/
           cp start_gui.bat stage/PGR/
-          cp tools/zip_guard.ps1 tools/catalog.json stage/PGR/tools/
-          cp README.md PACK_MANAGER.md RELEASE_V0_8.md THIRD_PARTY_NOTICES.md stage/PGR/docs/
+          cp tools/zip_guard.ps1 tools/zip_guard.py tools/catalog.json stage/PGR/tools/
+          cp README.md PACK_MANAGER.md PACK_BULK_INSTALL.md RELEASE_V0_8.md THIRD_PARTY_NOTICES.md stage/PGR/docs/
           cp deploy/PGR/Pack/README.txt stage/PGR/Pack/
           cp deploy/PGR/Project/README.txt stage/PGR/Project/
           powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
@@ -116,7 +116,7 @@ jobs:
         with:
           name: PGR_Make_windows_x64_candidate
           path: |
-            PGR_Make_0.8.0_Windows_x64.zip
+            PGR_Make_0.8.1_Windows_x64.zip
             SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 30

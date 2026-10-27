@@ -18,7 +18,7 @@ try {
     if($mode -eq 0xa000) { throw 'ZIP symlinks are forbidden' }
     if($entry.Length -gt 1GB) { throw 'Oversized file' }
     $total += $entry.Length
-    if($total -gt 2GB) { throw 'Oversized archive' }
+    if($total -gt 6GB) { throw 'Oversized archive' }
     $dest = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($root,$name.Replace('/',[System.IO.Path]::DirectorySeparatorChar)))
     if(-not $dest.StartsWith($root.TrimEnd('\','/') + [System.IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) { throw 'Path escape' }
   }

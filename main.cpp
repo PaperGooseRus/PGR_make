@@ -38,6 +38,7 @@
 #include "core/project_setup.hpp"
 #include "core/build_controller.hpp"
 #include "core/pack_manager.hpp"
+#include "core/pack_bulk.hpp"
 
 namespace fs = std::filesystem;
 using pgr_workspace::project_t;
@@ -51,6 +52,7 @@ static void print_help(const char* argv0) {
               << "  --pack-list               List registered installed tool versions\n"
               << "  --pack-catalog            List available vetted packages\n"
               << "  --pack-install ID         Install catalog package from HTTPS (SHA-256 required)\n"
+              << "  --pack-install-all        Download newest verified GCC, Clang, CMake, Ninja into Pack\n"
               << "  --pack-import ID ZIP      Install catalog package from local ZIP\n"
               << "  --pack-import-custom ID ZIP SHA256 EXE  Import a verified ZIP outside catalog\n"
               << "  --pack-register ID DIR EXE Register external tool installation\n"
@@ -155,7 +157,7 @@ int main(int argc, char* argv[]) {
         else if (a == "--clean") clean = true;
         else if (a == "--list") list = true;
         else if (a == "--toolchains") toolchains = true;
-        else if (a == "--pack-list" || a == "--pack-catalog") pack_action=a;
+        else if (a == "--pack-list" || a == "--pack-catalog" || a == "--pack-install-all") pack_action=a;
         else if ((a == "--pack-install" || a == "--pack-retire") && i+1<cli_args.size()) {
             pack_action=a;pack_id=cli_args[++i];
         }
@@ -235,11 +237,35 @@ int main(int argc, char* argv[]) {
             }
             return 0;
         }
-        const auto catalog_path=manager.catalog_file();
-        auto list=pgr_pack_manager::catalog(catalog_path,error);
+        auto list=pgr_pack_bulk::merged_catalog(registry.root(),registry.pack_root(),error);
         if(pack_action=="--pack-catalog") {
             if(!error.empty()) {std::cerr<<error<<'\n';return 1;}
             for(const auto& x:list) std::cout<<x.id<<'\t'<<x.url<<'\n';
+            return 0;
+        }
+        if(pack_action=="--pack-install-all") {
+            if(!error.empty()) {std::cerr<<"Pack catalog: "<<error<<'\n';return 1;}
+            const auto plan=pgr_pack_bulk::latest(list,manager);
+            for(const auto& id:plan.already_installed) std::cout<<"[Pack] already installed: "<<id<<'\n';
+            for(const auto& issue:plan.unavailable) std::cerr<<"[Pack] missing catalog entry: "<<issue<<'\n';
+            for(const auto& issue:plan.invalid) std::cerr<<"[Pack] invalid installed tool: "<<issue<<'\n';
+            if(!plan.ready()) {std::cerr<<"[Pack] No downloads started: the required toolchain cannot be completed safely.\n";return 1;}
+            if(plan.downloads.empty()) {std::cout<<"[Pack] All required verified versions are installed.\n";return 0;}
+            unsigned complete=0;
+            for(const auto& pkg:plan.downloads) {
+                std::cout<<"[Pack] Downloading "<<pkg.id<<" ("<<(complete+1)<<"/"<<plan.downloads.size()<<")\n"<<std::flush;
+                std::string install_error;
+                if(!manager.install(pkg,{},install_error)) {
+                    std::cerr<<"[Pack] Failed "<<pkg.id<<": "<<install_error<<'\n';
+                    // Keep verified earlier installations. Retry will skip them.
+                    return 1;
+                }
+                ++complete;
+                std::cout<<"[Pack] Installed "<<pkg.id;
+                for(const auto& companion:pkg.provides) std::cout<<", "<<companion.tool<<"@"<<companion.version;
+                std::cout<<'\n'<<std::flush;
+            }
+            std::cout<<"[Pack] Ready: GCC, Clang, CMake and Ninja.\n";
             return 0;
         }
         auto bind=[&](bool unbind)->int {

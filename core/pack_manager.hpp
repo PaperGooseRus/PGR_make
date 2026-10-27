@@ -17,8 +17,12 @@
 
 namespace pgr_pack_manager {
 namespace fs=std::filesystem;
+struct provided_tool {
+    std::string tool,version,executable;
+};
 struct package {
     std::string id,tool,version,platform,url,sha256,executable;
+    std::vector<provided_tool> provides; // Additional executables in one verified archive.
 };
 struct installed : package {
     fs::path root;
@@ -67,10 +71,22 @@ inline bool read_json(const fs::path& path,pgr_json::value& value) {
 inline bool parse_package(const pgr_json::value& value,package& pkg) {
     if(value.type!=pgr_json::value::kind::object) return false;
     pkg={str(value,"id"),str(value,"tool"),str(value,"version"),str(value,"platform"),
-         str(value,"url"),lowercase(str(value,"sha256")),str(value,"executable")};
-    return safe_id(pkg.id)&&safe_id(pkg.tool)&&safe_id(pkg.version)&&safe_id(pkg.platform)&&
-        safe_relative(fs::u8path(pkg.executable)) &&
-        (pkg.sha256.empty()||valid_sha(pkg.sha256));
+         str(value,"url"),lowercase(str(value,"sha256")),str(value,"executable"),{}};
+    if(!safe_id(pkg.id)||!safe_id(pkg.tool)||!safe_id(pkg.version)||!safe_id(pkg.platform)||
+       !safe_relative(fs::u8path(pkg.executable))||(!pkg.sha256.empty()&&!valid_sha(pkg.sha256))) return false;
+    const auto* extras=value.find("provides");
+    if(extras) {
+        if(extras->type!=pgr_json::value::kind::array || extras->array.size()>8) return false;
+        std::set<std::string> names={pkg.tool};
+        for(const auto& x:extras->array) {
+            if(x.type!=pgr_json::value::kind::object) return false;
+            provided_tool tool{str(x,"tool"),str(x,"version"),str(x,"executable")};
+            if(!safe_id(tool.tool)||!safe_id(tool.version)||!safe_relative(fs::u8path(tool.executable))||
+               !names.insert(tool.tool).second) return false;
+            pkg.provides.push_back(std::move(tool));
+        }
+    }
+    return true;
 }
 inline std::vector<package> catalog(const fs::path& file,std::string& error) {
     std::vector<package> result;
@@ -123,15 +139,16 @@ inline bool verify_tool(const installed& item,std::string& error) {
     if(executable.empty()||!fs::is_regular_file(executable,ec)||fs::is_symlink(executable,ec)) {
         error="tool executable is missing or symlinked";return false;
     }
+    // Verify integrity BEFORE executing a potentially replaced binary.
+    if(!item.binary_sha256.empty() && lowercase(pgr_sha256::file(executable))!=lowercase(item.binary_sha256)) {
+        error="installed executable has changed (SHA-256 mismatch)";return false;
+    }
     std::string first;
     pgr_process::options opt;opt.quiet=true;
     opt.output=[&](const std::string& line){if(first.empty()) first=line;};
     const auto rc=pgr_process::run_ex({pgr_workspace::utf8(executable),item.tool=="msvc"?"/Bv":"--version"},opt);
     if(rc!=0 || first.find(item.version)==std::string::npos) {
         error="executable version check failed (expected "+item.version+", got: "+first+")";return false;
-    }
-    if(!item.binary_sha256.empty() && lowercase(pgr_sha256::file(executable))!=lowercase(item.binary_sha256)) {
-        error="installed executable has changed (SHA-256 mismatch)";return false;
     }
     if(item.tool=="gcc" || item.tool=="clang") {
         // Explicitly imported compiler bundles may include their dependencies.
@@ -243,30 +260,39 @@ public:
     bool remove(const std::string& id,const std::vector<std::string>& references,std::string& error) {
         auto iter=std::find_if(records_.begin(),records_.end(),[&](const installed& a){return a.id==id;});
         if(iter==records_.end()){error="unknown tool id";return false;}
-        if(std::find(references.begin(),references.end(),id)!=references.end()) {
-            error="tool is referenced by a project or profile";return false;
+        // Versions supplied by one archive share one physical directory and
+        // must be retired together. Never invalidate a pinned companion.
+        const auto root=iter->root;
+        const bool managed=!iter->external;
+        for(const auto& entry:records_) {
+            if((managed && !entry.external && entry.root==root) || (!managed && entry.id==id)) {
+                if(std::find(references.begin(),references.end(),entry.id)!=references.end()) {
+                    error="tool (or bundle companion) is referenced by a project: "+entry.id;
+                    return false;
+                }
+            }
         }
-        // No deletion of actual distributions. Managed installation is quarantined,
-        // never recursively deleted by the manager.
-        if(!iter->external) {
-            const auto dest=pack_/"Retired"/fs::u8path(id);
+        const fs::path quarantine=pack_/"Retired"/fs::u8path(id);
+        bool moved=false;
+        if(managed) {
             std::error_code ec;
-            if(fs::exists(dest)){error="quarantine destination exists";return false;}
-            fs::create_directories(dest.parent_path(),ec);
-            if(ec){error=ec.message();return false;}
-            fs::rename(iter->root,dest,ec);
-            if(ec){error="unable to retire active tool: "+ec.message();return false;}
+            if(fs::exists(quarantine)) {error="quarantine destination exists";return false;}
+            fs::create_directories(quarantine.parent_path(),ec);
+            if(ec) {error=ec.message();return false;}
+            fs::rename(root,quarantine,ec);
+            if(ec) {error="unable to retire active tool: "+ec.message();return false;}
+            moved=true;
         }
         const auto original=records_;
-        records_.erase(iter);
+        records_.erase(std::remove_if(records_.begin(),records_.end(),[&](const installed& entry){
+            return managed?(!entry.external && entry.root==root):(entry.id==id);
+        }),records_.end());
         if(!save(error)) {
             records_=original;
-            if(!original.empty()) {
-                const auto& rec=*std::find_if(original.begin(),original.end(),[&](const installed& entry){return entry.id==id;});
-                if(!rec.external) {
-                    std::error_code ec;
-                    fs::rename(pack_/"Retired"/fs::u8path(id),rec.root,ec);
-                }
+            if(moved) {
+                std::error_code ec;
+                fs::rename(quarantine,root,ec);
+                if(ec) error+="; restoring active bundle failed: "+ec.message();
             }
             return false;
         }
@@ -276,6 +302,17 @@ public:
         if(!safe_id(pkg.id)||!safe_id(pkg.tool)||!safe_id(pkg.version)||!safe_id(pkg.platform)||
            !safe_relative(fs::u8path(pkg.executable))||!valid_sha(pkg.sha256)||find(pkg.id)) {
             error="invalid package, missing SHA-256, or version already installed";return false;
+        }
+        // All tools supplied by one archive share the same installation root.
+        // Reject duplicates before downloading: no partial bundle registration.
+        std::set<std::string> provided_names={pkg.tool};
+        for(const auto& extra:pkg.provides) {
+            const std::string id=extra.tool+"@"+extra.version+"@"+pkg.platform;
+            if(!safe_id(extra.tool)||!safe_id(extra.version)||
+               !safe_relative(fs::u8path(extra.executable))||
+               !provided_names.insert(extra.tool).second||find(id)) {
+                error="invalid or already installed companion in compiler bundle: "+id;return false;
+            }
         }
         if(pkg.platform!=platform()) {error="archive is for a different platform: "+pkg.platform;return false;}
         if(!local_archive.empty() && !fs::is_regular_file(local_archive)) {error="ZIP archive not found";return false;}
@@ -297,7 +334,7 @@ public:
         if(archive.empty()) {
             archive=staging/"package.zip";
             if(pgr_process::run({"curl","--fail","--location","--proto","=https","--proto-redir","=https","--tlsv1.2",
-                                 "--max-time","240","--output",pgr_workspace::utf8(archive),pkg.url},true)!=0) {
+                                 "--max-time","1800","--output",pgr_workspace::utf8(archive),pkg.url},true)!=0) {
                 error="HTTPS download failed; install curl or import a local archive";return false;
             }
         }
@@ -351,13 +388,38 @@ public:
         if(!verify_tool(staged,error)) return false;
         record.binary_sha256=pgr_sha256::file(content/relative);
         if(!valid_sha(record.binary_sha256)) {error="cannot hash installed executable";return false;}
+        std::vector<installed> additional;
+        for(const auto& extra:pkg.provides) {
+            installed companion;
+            companion.tool=extra.tool;
+            companion.version=extra.version;
+            companion.platform=pkg.platform;
+            companion.id=extra.tool+"@"+extra.version+"@"+pkg.platform;
+            companion.url=pkg.url;
+            companion.sha256=pkg.sha256;
+            companion.executable=extra.executable;
+            companion.root=record.root;
+            const auto companion_exe=content/fs::u8path(extra.executable);
+            if(!fs::is_regular_file(companion_exe,ec)) {error="bundle companion executable missing: "+extra.executable;return false;}
+#ifndef _WIN32
+            auto perms=fs::status(companion_exe,ec).permissions();
+            if(!ec) fs::permissions(companion_exe,perms|fs::perms::owner_exec|fs::perms::group_exec|fs::perms::others_exec,ec);
+#endif
+            staged=companion;staged.root=content;
+            if(!verify_tool(staged,error)) {error="bundle companion "+companion.id+": "+error;return false;}
+            companion.binary_sha256=pgr_sha256::file(companion_exe);
+            if(!valid_sha(companion.binary_sha256)) {error="cannot hash companion executable";return false;}
+            additional.push_back(std::move(companion));
+        }
         fs::create_directories(final.parent_path(),ec);
         if(ec){error=ec.message();return false;}
         fs::rename(content,final,ec);
         if(ec){error="unable to move verified tool into Pack: "+ec.message();return false;}
+        const auto count_before=records_.size();
         records_.push_back(record);
+        records_.insert(records_.end(),additional.begin(),additional.end());
         if(!save(error)) {
-            records_.pop_back();
+            records_.resize(count_before);
             // Do not destroy the installed directory after a registry failure.
             return false;
         }

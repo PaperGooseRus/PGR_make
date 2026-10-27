@@ -29,6 +29,7 @@
 #include "../core/build_controller.hpp"
 #include "../core/toolchain_manager.hpp"
 #include "../core/pack_manager.hpp"
+#include "../core/pack_bulk.hpp"
 #include "../core/make.hpp"
 #include "../core/pack_tools.hpp"
 #include "../core/project_setup.hpp"
@@ -1650,8 +1651,57 @@ static void pack_retire_confirmed(GtkButton* button,gpointer data) {
     if(window)gtk_window_close(GTK_WINDOW(window));
     run_pack_cli(action->ui,{"--pack-retire",action->id},"Карантин версии "+action->id);
 }
+static void pack_bulk_confirmed(GtkButton* button,gpointer data) {
+    auto* ui=static_cast<Gui*>(data);
+    GtkWindow* confirmation=GTK_WINDOW(gtk_widget_get_ancestor(GTK_WIDGET(button),GTK_TYPE_WINDOW));
+    GtkWindow* pack_dialog=gtk_window_get_transient_for(confirmation);
+    // Dismiss both modal windows before starting the asynchronous CLI process.
+    gtk_window_destroy(confirmation);
+    if(pack_dialog) gtk_window_destroy(pack_dialog);
+    run_pack_cli(ui,{"--pack-install-all"},"Установка актуального набора GCC / Clang / CMake / Ninja");
+}
 static void pack_action_clicked(GtkButton* button,gpointer data) {
     auto* item=static_cast<PackAction*>(data);
+    if(item->operation=="all") {
+        pgr_pack_manager::manager registry(item->ui->registry.pack_root(),item->ui->registry.root());
+        std::string error;
+        if(!registry.load(error)) {set_status(item->ui,"Pack: "+error);return;}
+        const auto available=pgr_pack_bulk::merged_catalog(item->ui->registry.root(),item->ui->registry.pack_root(),error);
+        if(!error.empty()) {set_status(item->ui,"Pack: "+error);return;}
+        const auto plan=pgr_pack_bulk::latest(available,registry);
+        GtkWidget* parent=gtk_widget_get_ancestor(GTK_WIDGET(button),GTK_TYPE_WINDOW);
+        GtkWidget* confirm=gtk_window_new();
+        gtk_widget_add_css_class(confirm,"pgr-dialog");
+        gtk_window_set_title(GTK_WINDOW(confirm),"Пакетная установка инструментов");
+        gtk_window_set_transient_for(GTK_WINDOW(confirm),GTK_WINDOW(parent));
+        gtk_window_set_modal(GTK_WINDOW(confirm),TRUE);
+        gtk_window_set_default_size(GTK_WINDOW(confirm),560,260);
+        GtkWidget* body=column(12);margins(body,18);
+        gtk_window_set_child(GTK_WINDOW(confirm),body);
+        GtkWidget* intro=label("Будут установлены последние проверенные версии из каталога Pack.\nСуществующие версии сохраняются; большие архивы могут потребовать несколько ГБ диска.");
+        gtk_label_set_wrap(GTK_LABEL(intro),TRUE);
+        gtk_box_append(GTK_BOX(body),intro);
+        for(const auto& pkg:plan.downloads) {
+            std::string description="• "+pkg.id;
+            for(const auto& companion:pkg.provides) description+=" + "+companion.tool+" "+companion.version;
+            gtk_box_append(GTK_BOX(body),label(description.c_str()));
+        }
+        for(const auto& entry:plan.unavailable) gtk_box_append(GTK_BOX(body),label(("Нет пакета: "+entry).c_str()));
+        for(const auto& entry:plan.invalid) gtk_box_append(GTK_BOX(body),label(("Проверка не пройдена: "+entry).c_str()));
+        if(plan.downloads.empty()&&plan.ready()) gtk_box_append(GTK_BOX(body),label("Все необходимые версии уже установлены."));
+        GtkWidget* actions=row(8);
+        gtk_box_append(GTK_BOX(body),actions);
+        GtkWidget* cancel=gtk_button_new_with_label("Отмена");
+        gtk_box_append(GTK_BOX(actions),cancel);
+        g_signal_connect_swapped(cancel,"clicked",G_CALLBACK(gtk_window_close),confirm);
+        GtkWidget* start=gtk_button_new_with_label("Скачать и установить");
+        gtk_widget_add_css_class(start,"suggested-action");
+        gtk_widget_set_sensitive(start,plan.ready()&&!plan.downloads.empty());
+        gtk_box_append(GTK_BOX(actions),start);
+        g_signal_connect(start,"clicked",G_CALLBACK(pack_bulk_confirmed),item->ui);
+        gtk_window_present(GTK_WINDOW(confirm));
+        return;
+    }
     if(item->operation=="import") {
         GtkFileDialog* chooser=gtk_file_dialog_new();
         gtk_file_dialog_set_title(chooser,"Локальный архив инструмента (*.zip)");
@@ -1703,6 +1753,16 @@ static void open_pack_manager(Gui* ui) {
     GtkWidget* body=column(10);margins(body,16);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll),body);
     gtk_window_set_child(GTK_WINDOW(window),scroll);
+    // The main action performs one background CLI operation. The CLI uses
+    // SHA-256 verification, staging, version checks and the Pack registry.
+    GtkWidget* bulk=row(10);
+    gtk_box_append(GTK_BOX(body),bulk);
+    GtkWidget* bulk_text=label("Быстрая установка: GCC + Clang + CMake + Ninja (последние проверенные версии каталога)");
+    gtk_widget_set_hexpand(bulk_text,TRUE);
+    gtk_label_set_wrap(GTK_LABEL(bulk_text),TRUE);
+    gtk_box_append(GTK_BOX(bulk),bulk_text);
+    pack_button(ui,bulk,"Скачать необходимые инструменты","all","");
+    gtk_box_append(GTK_BOX(body),gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
     if(!ui->missing_pin.empty()) {
         auto* missing=label(("Требуется проекту: "+ui->missing_pin+". Проверьте доступные версии ниже.").c_str());
         gtk_label_set_wrap(GTK_LABEL(missing),TRUE);
@@ -1725,7 +1785,7 @@ static void open_pack_manager(Gui* ui) {
     }
     GtkWidget* catalog_title=label("Каталог доступных версий · официальные дистрибутивы с SHA-256");
     gtk_widget_add_css_class(catalog_title,"title-3");gtk_box_append(GTK_BOX(body),catalog_title);
-    std::vector<pgr_pack_manager::package> available=pgr_pack_manager::catalog(manager.catalog_file(),error);
+    std::vector<pgr_pack_manager::package> available=pgr_pack_bulk::merged_catalog(ui->registry.root(),ui->registry.pack_root(),error);
     if(!error.empty())gtk_box_append(GTK_BOX(body),label(error.c_str()));
     if(!ui->missing_pin.empty()) std::stable_partition(available.begin(),available.end(),
         [ui](const auto& p){return p.id==ui->missing_pin;});
@@ -1741,7 +1801,7 @@ static void open_pack_manager(Gui* ui) {
         gtk_box_append(GTK_BOX(body),line);
         gtk_box_append(GTK_BOX(body),gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
     }
-    gtk_box_append(GTK_BOX(body),label("Другие GCC/Clang/ARM: добавьте проверенный дистрибутив в Pack/catalog.json или зарегистрируйте внешний toolchain через CLI. MSVC устанавливается штатным установщиком Microsoft."));
+    gtk_box_append(GTK_BOX(body),label("GCC и Clang устанавливаются одним проверенным комплектом WinLibs UCRT x64. Для ARM/RISC-V и MSVC используйте отдельные дистрибутивы и штатные установщики; они не входят в стандартный набор."));
     gtk_window_present(GTK_WINDOW(window));
 }
 static void run_action(GtkButton*, gpointer payload) {

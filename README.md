@@ -224,3 +224,8 @@ python3 tests/run_features.py build-review/PGR_Make
 ### Оформление GTK4
 
 По умолчанию используется **Ash & Orange** (`#1A1A1A` / `#D97757`). Светлая тема переключается в шапке GUI. Подробнее: [GUI_THEME.md](GUI_THEME.md).
+
+
+## Массовая установка инструментов (0.8.1)
+
+В **Pack Manager** доступна кнопка «Скачать необходимые инструменты». Она запускает проверенную пакетную установку GCC/Clang, CMake и Ninja в `Pack` (только для платформ с полным доверенным каталогом). Через CLI: `PGR_Make --pack-install-all`. Пояснения, источники контрольных сумм и ограничения: [PACK_BULK_INSTALL.md](PACK_BULK_INSTALL.md).

@@ -17,6 +17,7 @@ if not exist "deploy\PGR\Project" mkdir "deploy\PGR\Project"
 if not exist "deploy\PGR\tools" mkdir "deploy\PGR\tools"
 copy /Y "tools\zip_guard.ps1" "deploy\PGR\tools\zip_guard.ps1" >nul
 copy /Y "tools\zip_guard.py" "deploy\PGR\tools\zip_guard.py" >nul
+copy /Y "tools\catalog.json" "deploy\PGR\tools\catalog.json" >nul
 if not exist "deploy\PGR\Pack\catalog.json" copy "tools\catalog.json" "deploy\PGR\Pack\catalog.json" >nul
 copy /Y "build-win\PGR_Make.exe" "deploy\PGR\PGR_Make.exe" >nul
 if errorlevel 1 (popd & exit /b 1)

@@ -10,7 +10,7 @@ import stat
 import sys
 import zipfile
 
-MAX_TOTAL = 2 * 1024**3
+MAX_TOTAL = 6 * 1024**3
 MAX_FILES = 50000
 MAX_ENTRY = 1024**3
 
